@@ -1,0 +1,25 @@
+# Требует Python 3.12
+#   brew install python@3.12
+#   python3.12 -m venv venv && source venv/bin/activate
+#   pip install -r requirements.txt
+
+# Core Scientific Computing
+numpy>=1.24.0,<2.0.0
+scipy>=1.10.0,<1.14.0
+scikit-image>=0.21.0,<0.25.0
+
+# Computer Vision
+opencv-python>=4.7.0,<4.11.0
+Pillow>=9.5.0,<11.0.0
+
+# Deep Learning (CPU; для GPU — torch с CUDA из https://pytorch.org)
+torch>=2.0.0,<2.5.0
+
+# Geometric Operations
+shapely>=2.0.0,<2.1.0
+
+# Performance Optimization
+numba>=0.57.0,<0.60.0
+
+# Data Visualization
+matplotlib>=3.7.0,<3.10.0
