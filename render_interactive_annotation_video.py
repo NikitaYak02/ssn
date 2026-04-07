@@ -43,7 +43,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw
 
 
 DEFAULT_CLASS_INFO = [
@@ -78,6 +78,19 @@ def _hex_to_bgr(h: str) -> Tuple[int, int, int]:
     g = int(h[2:4], 16)
     b = int(h[4:6], 16)
     return b, g, r
+
+
+def _hex_to_rgba(h: str, alpha: int) -> Tuple[int, int, int, int]:
+    h = h.lstrip("#")
+    r = int(h[0:2], 16)
+    g = int(h[2:4], 16)
+    b = int(h[4:6], 16)
+    return r, g, b, int(alpha)
+
+
+def _bgr_to_rgba(color: Tuple[int, int, int], alpha: int) -> Tuple[int, int, int, int]:
+    b, g, r = color
+    return int(r), int(g), int(b), int(alpha)
 
 
 def _even(v: int) -> int:
@@ -382,6 +395,28 @@ def load_optional_image(image_path: Optional[Path], render_width: int, render_he
     return cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
 
 
+def load_snapshot_image(
+    run_dir: Path,
+    checkpoint_index: int,
+    render_width: int,
+    render_height: int,
+    cache: Dict[int, Optional[np.ndarray]],
+) -> Optional[np.ndarray]:
+    if checkpoint_index in cache:
+        cached = cache[checkpoint_index]
+        return None if cached is None else cached.copy()
+
+    path = run_dir / f"frame_{checkpoint_index:06d}.png"
+    if not path.exists():
+        cache[checkpoint_index] = None
+        return None
+
+    image = Image.open(path).convert("RGB").resize((render_width, render_height), Image.Resampling.BILINEAR)
+    bgr = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+    cache[checkpoint_index] = bgr
+    return bgr.copy()
+
+
 def find_image_for_run(run_dir: Path, image: Optional[Path], image_dir: Optional[Path]) -> Optional[Path]:
     if image is not None:
         return image
@@ -402,6 +437,29 @@ def blank_background(width: int, height: int) -> np.ndarray:
     base[..., 1] = 30 + 22 * y_grad
     base[..., 2] = 34 + 28 * (1.0 - x_grad * 0.6)
     return np.clip(base, 0, 255).astype(np.uint8)
+
+
+def _poly_points_xy(points_px: np.ndarray) -> List[Tuple[int, int]]:
+    arr = np.asarray(points_px, dtype=np.int32)
+    if arr.ndim == 3 and arr.shape[1] == 1:
+        arr = arr[:, 0, :]
+    if arr.ndim != 2 or arr.shape[0] < 2 or arr.shape[1] != 2:
+        return []
+    return [(int(x), int(y)) for x, y in arr]
+
+
+def _max_present_code(*sources: object) -> int:
+    max_code = 1
+    for source in sources:
+        if source is None:
+            continue
+        iterable = source.values() if isinstance(source, dict) else source
+        for item in iterable:
+            code = getattr(item, "code", None)
+            if code is None:
+                continue
+            max_code = max(max_code, int(code))
+    return max_code
 
 
 def _blend_fill(img: np.ndarray, color_to_polys: Dict[Tuple[int, int, int], List[np.ndarray]], alpha: float) -> None:
@@ -429,45 +487,54 @@ def render_panel(
     class_info: Sequence[Tuple[str, str]],
     show_borders: bool = True,
 ) -> np.ndarray:
-    panel = base_image.copy() if base_image is not None else blank_background(state.render_width, state.render_height)
+    base_panel = base_image.copy() if base_image is not None else blank_background(state.render_width, state.render_height)
+    base_rgba = Image.fromarray(cv2.cvtColor(base_panel, cv2.COLOR_BGR2RGB)).convert("RGBA")
+    overlay = Image.new("RGBA", (state.render_width, state.render_height), (255, 255, 255, 0))
+    draw = ImageDraw.Draw(overlay)
 
-    anno_groups: Dict[Tuple[int, int, int], List[np.ndarray]] = defaultdict(list)
     for anno in annotations_by_sp.values():
+        poly = _poly_points_xy(anno.poly_px)
+        if len(poly) < 3:
+            continue
         class_idx = max(0, min(len(class_info) - 1, int(anno.code) - 1))
-        anno_groups[_hex_to_bgr(class_info[class_idx][1])].append(anno.poly_px)
-    _blend_fill(panel, anno_groups, alpha=0.42)
+        draw.polygon(poly, fill=_hex_to_rgba(class_info[class_idx][1], 110))
 
     if show_borders:
-        _draw_superpixel_borders(panel, state.superpixels_by_id.values(), _BORDER_BGR, thickness=1)
+        for poly_px in state.superpixels_by_id.values():
+            poly = _poly_points_xy(poly_px)
+            if len(poly) < 3:
+                continue
+            draw.polygon(poly, outline=(255, 255, 0, 255))
 
-    if highlight_direct:
-        overlay = panel.copy()
-        direct_polys = [state.annotations_by_sp[sp_id].poly_px for sp_id in highlight_direct if sp_id in state.annotations_by_sp]
-        if direct_polys:
-            cv2.fillPoly(overlay, direct_polys, _DIRECT_BRG)
-            cv2.addWeighted(overlay, 0.58, panel, 0.42, 0.0, dst=panel)
-            _draw_superpixel_borders(panel, direct_polys, (15, 15, 15), thickness=2)
+    for sp_id in highlight_direct:
+        anno = state.annotations_by_sp.get(sp_id)
+        if anno is None:
+            continue
+        poly = _poly_points_xy(anno.poly_px)
+        if len(poly) < 3:
+            continue
+        draw.polygon(poly, fill=_bgr_to_rgba(_DIRECT_BRG, 148), outline=(15, 15, 15, 255))
 
-    if highlight_prop:
-        overlay = panel.copy()
-        prop_polys = [state.annotations_by_sp[sp_id].poly_px for sp_id in highlight_prop if sp_id in state.annotations_by_sp]
-        if prop_polys:
-            cv2.fillPoly(overlay, prop_polys, _PROP_BRG)
-            cv2.addWeighted(overlay, 0.50, panel, 0.50, 0.0, dst=panel)
-            _draw_superpixel_borders(panel, prop_polys, (30, 30, 30), thickness=2)
+    for sp_id in highlight_prop:
+        anno = state.annotations_by_sp.get(sp_id)
+        if anno is None:
+            continue
+        poly = _poly_points_xy(anno.poly_px)
+        if len(poly) < 3:
+            continue
+        draw.polygon(poly, fill=_bgr_to_rgba(_PROP_BRG, 128), outline=(30, 30, 30, 255))
 
+    composite = Image.alpha_composite(base_rgba, overlay)
+    draw_scribbles = ImageDraw.Draw(composite)
     for scrib in scribbles:
+        line_pts = _poly_points_xy(scrib.points_px)
+        if len(line_pts) < 2:
+            continue
         class_idx = max(0, min(len(class_info) - 1, int(scrib.code) - 1))
-        color = _hex_to_bgr(class_info[class_idx][1])
-        pts = scrib.points_px
-        cv2.polylines(panel, [pts], False, (255, 255, 255), thickness=6, lineType=cv2.LINE_AA)
-        cv2.polylines(panel, [pts], False, color, thickness=3, lineType=cv2.LINE_AA)
-        first_pt = tuple(int(v) for v in pts[0, 0])
-        label_pt = (min(panel.shape[1] - 80, first_pt[0] + 6), max(18, first_pt[1] - 6))
-        cv2.putText(panel, f"#{scrib.sid}", label_pt, cv2.FONT_HERSHEY_SIMPLEX, 0.55, (10, 10, 10), 3, cv2.LINE_AA)
-        cv2.putText(panel, f"#{scrib.sid}", label_pt, cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 1, cv2.LINE_AA)
+        draw_scribbles.line(line_pts, fill=_hex_to_rgba(class_info[class_idx][1], 255), width=5)
 
-    return panel
+    panel_rgb = np.array(composite.convert("RGB"), dtype=np.uint8)
+    return cv2.cvtColor(panel_rgb, cv2.COLOR_RGB2BGR)
 
 
 def _draw_text_block(canvas: np.ndarray, lines: Sequence[str], origin: Tuple[int, int], color: Tuple[int, int, int], scale: float, line_gap: int) -> None:
@@ -485,18 +552,23 @@ def compose_canvas(
     subtitle: str,
     footer: str,
 ) -> np.ndarray:
-    header_h = 96
-    footer_h = 64
-    h, w = panel.shape[:2]
-    canvas = np.full((header_h + h + footer_h, w, 3), _BG_BGR, dtype=np.uint8)
-    canvas[:header_h] = _PANEL_BG_BGR
-    canvas[header_h:header_h + h] = panel
-    canvas[header_h + h:] = _PANEL_BG_BGR
+    canvas = panel.copy()
+    h, w = canvas.shape[:2]
+    overlay = canvas.copy()
 
-    _draw_text_block(canvas, [run_name], (18, 28), _TEXT_SUB_BGR, 0.55, 24)
-    _draw_text_block(canvas, [title], (18, 58), _TEXT_MAIN_BGR, 0.78, 26)
-    _draw_text_block(canvas, [subtitle], (18, 84), _TEXT_SUB_BGR, 0.52, 24)
-    _draw_text_block(canvas, [footer], (18, header_h + h + 38), _TEXT_SUB_BGR, 0.50, 22)
+    top_x0, top_y0 = 18, 18
+    top_x1, top_y1 = min(w - 18, 18 + 760), min(h - 18, 18 + 94)
+    bot_x0, bot_y0 = 18, max(18, h - 56)
+    bot_x1, bot_y1 = min(w - 18, 18 + 980), h - 18
+
+    cv2.rectangle(overlay, (top_x0, top_y0), (top_x1, top_y1), (12, 12, 12), thickness=-1)
+    cv2.rectangle(overlay, (bot_x0, bot_y0), (bot_x1, bot_y1), (12, 12, 12), thickness=-1)
+    cv2.addWeighted(overlay, 0.42, canvas, 0.58, 0.0, dst=canvas)
+
+    _draw_text_block(canvas, [run_name], (30, 38), _TEXT_SUB_BGR, 0.50, 22)
+    _draw_text_block(canvas, [title], (30, 66), _TEXT_MAIN_BGR, 0.72, 24)
+    _draw_text_block(canvas, [subtitle], (30, 92), _TEXT_SUB_BGR, 0.48, 22)
+    _draw_text_block(canvas, [footer], (30, h - 30), _TEXT_SUB_BGR, 0.46, 20)
     return canvas
 
 
@@ -537,6 +609,26 @@ def metrics_footer(metrics: Optional[Dict[str, float]]) -> str:
     return " | ".join(parts + [legend]) if parts else legend
 
 
+def _open_video_writer(
+    out_path: Path,
+    fps: float,
+    frame_size: Tuple[int, int],
+    logger: logging.Logger,
+) -> Tuple[cv2.VideoWriter, str]:
+    codec_candidates = ("avc1", "H264", "mp4v")
+    attempted: List[str] = []
+    for codec_name in codec_candidates:
+        attempted.append(codec_name)
+        writer = cv2.VideoWriter(str(out_path), cv2.VideoWriter_fourcc(*codec_name), float(fps), frame_size)
+        if writer.isOpened():
+            logger.info("Using video codec %s for %s", codec_name, out_path)
+            return writer, codec_name
+        writer.release()
+    raise RuntimeError(
+        f"Cannot open video writer for {out_path}. Tried codecs: {', '.join(attempted)}"
+    )
+
+
 def render_run_video(
     run_dir: Path,
     out_path: Path,
@@ -554,15 +646,19 @@ def render_run_video(
     states = [load_state(path, max_side=max_side, method=method) for path in state_files]
     events = build_events(states)
     metrics_by_step = _read_metrics_csv(run_dir / "metrics.csv")
+    snapshot_cache: Dict[int, Optional[np.ndarray]] = {}
 
     base_image = load_optional_image(image_path, states[0].render_width, states[0].render_height) if image_path else None
 
     frame_w = states[0].render_width
-    frame_h = states[0].render_height + 96 + 64
+    frame_h = states[0].render_height
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    writer = cv2.VideoWriter(str(out_path), cv2.VideoWriter_fourcc(*"mp4v"), float(fps), (frame_w, frame_h))
-    if not writer.isOpened():
-        raise RuntimeError(f"Cannot open video writer for {out_path}")
+    writer, _codec_name = _open_video_writer(
+        out_path=out_path,
+        fps=float(fps),
+        frame_size=(frame_w, frame_h),
+        logger=logger,
+    )
     try:
         max_gap = max((event.step_delta for event in events), default=0)
         intro = make_intro_frame(run_dir.name, frame_w, frame_h, states[-1].n_scribbles, max_gap)
@@ -571,27 +667,49 @@ def render_run_video(
 
         prev_annotations: Dict[int, AnnotationData] = {}
         prev_step = 0
-        for state, event in zip(states, events):
+        for idx, (state, event) in enumerate(zip(states, events)):
             metrics = metrics_by_step.get(state.n_scribbles)
             footer = metrics_footer(metrics)
-
-            before_panel = render_panel(
-                state=state,
-                base_image=base_image,
-                annotations_by_sp=prev_annotations,
-                highlight_direct=[],
-                highlight_prop=[],
-                scribbles=[],
-                class_info=_build_default_class_info(max(1, max((a.code for a in state.annotations_by_sp.values()), default=1))),
+            prev_scribbles: Sequence[ScribbleData] = states[idx - 1].scribbles if idx > 0 else ()
+            prev_snapshot = None
+            if idx > 0:
+                prev_snapshot = load_snapshot_image(
+                    run_dir=run_dir,
+                    checkpoint_index=states[idx - 1].checkpoint_index,
+                    render_width=state.render_width,
+                    render_height=state.render_height,
+                    cache=snapshot_cache,
+                )
+            current_snapshot = load_snapshot_image(
+                run_dir=run_dir,
+                checkpoint_index=state.checkpoint_index,
+                render_width=state.render_width,
+                render_height=state.render_height,
+                cache=snapshot_cache,
             )
+
+            if prev_snapshot is not None:
+                before_panel = prev_snapshot
+            else:
+                before_panel = render_panel(
+                    state=state,
+                    base_image=base_image,
+                    annotations_by_sp=prev_annotations,
+                    highlight_direct=[],
+                    highlight_prop=[],
+                    scribbles=prev_scribbles,
+                    class_info=_build_default_class_info(_max_present_code(prev_annotations, prev_scribbles, state.annotations_by_sp, state.scribbles)),
+                )
             before_title = f"Before step {state.n_scribbles}" if event.step_delta == 1 else f"Before checkpoint {state.checkpoint_index}"
             before_sub = f"Saved annotations: {len(prev_annotations)} superpixels"
             before_canvas = compose_canvas(before_panel, run_dir.name, before_title, before_sub, footer)
             for _ in range(max(1, timing.pre_frames)):
                 writer.write(before_canvas)
 
-            class_info = _build_default_class_info(max(1, max((a.code for a in state.annotations_by_sp.values()), default=1)))
             new_scribbles = list(event.new_scribbles)
+            class_info = _build_default_class_info(
+                _max_present_code(prev_annotations, state.annotations_by_sp, prev_scribbles, new_scribbles, state.scribbles)
+            )
             focus_title = (
                 f"Step {state.n_scribbles}: scribble {new_scribbles[0].sid}"
                 if event.exact and len(new_scribbles) == 1
@@ -606,12 +724,13 @@ def render_run_video(
             if event.step_delta > 0:
                 direct_panel = render_panel(
                     state=state,
-                    base_image=base_image,
-                    annotations_by_sp=prev_annotations,
+                    base_image=prev_snapshot if prev_snapshot is not None else base_image,
+                    annotations_by_sp={} if prev_snapshot is not None else prev_annotations,
                     highlight_direct=event.direct_sp_ids,
                     highlight_prop=[],
-                    scribbles=new_scribbles,
+                    scribbles=new_scribbles if prev_snapshot is not None else [*prev_scribbles, *new_scribbles],
                     class_info=class_info,
+                    show_borders=(prev_snapshot is None),
                 )
                 direct_canvas = compose_canvas(direct_panel, run_dir.name, focus_title, focus_sub, footer)
                 for _ in range(max(1, timing.direct_frames)):
@@ -619,26 +738,30 @@ def render_run_video(
 
                 prop_panel = render_panel(
                     state=state,
-                    base_image=base_image,
-                    annotations_by_sp=prev_annotations,
+                    base_image=prev_snapshot if prev_snapshot is not None else base_image,
+                    annotations_by_sp={} if prev_snapshot is not None else prev_annotations,
                     highlight_direct=event.direct_sp_ids,
                     highlight_prop=event.propagated_sp_ids,
-                    scribbles=new_scribbles,
+                    scribbles=new_scribbles if prev_snapshot is not None else [*prev_scribbles, *new_scribbles],
                     class_info=class_info,
+                    show_borders=(prev_snapshot is None),
                 )
                 prop_canvas = compose_canvas(prop_panel, run_dir.name, focus_title, focus_sub, footer)
                 for _ in range(max(1, timing.prop_frames)):
                     writer.write(prop_canvas)
 
-            final_panel = render_panel(
-                state=state,
-                base_image=base_image,
-                annotations_by_sp=state.annotations_by_sp,
-                highlight_direct=[],
-                highlight_prop=[],
-                scribbles=[],
-                class_info=class_info,
-            )
+            if current_snapshot is not None:
+                final_panel = current_snapshot
+            else:
+                final_panel = render_panel(
+                    state=state,
+                    base_image=base_image,
+                    annotations_by_sp=state.annotations_by_sp,
+                    highlight_direct=[],
+                    highlight_prop=[],
+                    scribbles=state.scribbles,
+                    class_info=class_info,
+                )
             final_title = f"Committed state after step {state.n_scribbles}"
             if event.step_delta > 1:
                 final_title += f" (+{event.step_delta} saved together)"
@@ -650,15 +773,25 @@ def render_run_video(
             prev_annotations = dict(state.annotations_by_sp)
             prev_step = state.n_scribbles
 
-        outro_panel = render_panel(
-            state=states[-1],
-            base_image=base_image,
-            annotations_by_sp=states[-1].annotations_by_sp,
-            highlight_direct=[],
-            highlight_prop=[],
-            scribbles=[],
-            class_info=_build_default_class_info(max(1, max((a.code for a in states[-1].annotations_by_sp.values()), default=1))),
+        outro_snapshot = load_snapshot_image(
+            run_dir=run_dir,
+            checkpoint_index=states[-1].checkpoint_index,
+            render_width=states[-1].render_width,
+            render_height=states[-1].render_height,
+            cache=snapshot_cache,
         )
+        if outro_snapshot is not None:
+            outro_panel = outro_snapshot
+        else:
+            outro_panel = render_panel(
+                state=states[-1],
+                base_image=base_image,
+                annotations_by_sp=states[-1].annotations_by_sp,
+                highlight_direct=[],
+                highlight_prop=[],
+                scribbles=states[-1].scribbles,
+                class_info=_build_default_class_info(_max_present_code(states[-1].annotations_by_sp, states[-1].scribbles)),
+            )
         outro_canvas = compose_canvas(
             outro_panel,
             run_dir.name,

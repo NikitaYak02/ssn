@@ -3,6 +3,9 @@ import logging
 import sys
 from pathlib import Path
 
+import numpy as np
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -202,3 +205,97 @@ def test_render_run_video_writes_mp4(tmp_path):
 
     assert out_path.exists()
     assert out_path.stat().st_size > 0
+
+
+def test_render_panel_matches_snapshot_style_alpha_composite(tmp_path):
+    run_dir = tmp_path / "run_panel"
+    run_dir.mkdir()
+
+    sp1 = _build_superpixel(1, _rect(0.25, 0.25, 0.75, 0.75))
+    state1 = _state_payload(
+        step=1,
+        scribbles=[_build_scribble(1, 2, (0.30, 0.50), (0.70, 0.50))],
+        annotations=[_build_annotation(0, 2, 1, sp1["border"], [1], True)],
+        superpixels=[sp1],
+        width=20,
+        height=20,
+    )
+
+    _write_state(run_dir / "state_000001.json", state1)
+    state = replay.load_state(run_dir / "state_000001.json", max_side=20, method=None)
+    base = np.full((state.render_height, state.render_width, 3), 255, dtype=np.uint8)
+
+    panel = replay.render_panel(
+        state=state,
+        base_image=base,
+        annotations_by_sp=state.annotations_by_sp,
+        highlight_direct=[],
+        highlight_prop=[],
+        scribbles=[],
+        class_info=replay._build_default_class_info(2),
+        show_borders=False,
+    )
+
+    center_px = tuple(int(v) for v in panel[state.render_height // 2, state.render_width // 2])
+    expected_bgr = (145, 145, 255)
+    assert all(abs(got - exp) <= 1 for got, exp in zip(center_px, expected_bgr))
+
+
+def test_open_video_writer_prefers_h264_family_and_falls_back(monkeypatch, tmp_path):
+    attempts = []
+
+    class FakeWriter:
+        def __init__(self, path, fourcc, fps, frame_size):
+            attempts.append(fourcc)
+            self._fourcc = fourcc
+
+        def isOpened(self):
+            return self._fourcc == "H264"
+
+        def release(self):
+            return None
+
+    monkeypatch.setattr(replay.cv2, "VideoWriter_fourcc", lambda *chars: "".join(chars))
+    monkeypatch.setattr(replay.cv2, "VideoWriter", FakeWriter)
+
+    logger = logging.getLogger("codec_test")
+    logger.handlers.clear()
+    logger.addHandler(logging.NullHandler())
+
+    writer, codec_name = replay._open_video_writer(
+        out_path=tmp_path / "out.mp4",
+        fps=8.0,
+        frame_size=(64, 64),
+        logger=logger,
+    )
+
+    assert isinstance(writer, FakeWriter)
+    assert codec_name == "H264"
+    assert attempts == ["avc1", "H264"]
+
+
+def test_open_video_writer_raises_when_no_codec_is_available(monkeypatch, tmp_path):
+    class FakeWriter:
+        def __init__(self, path, fourcc, fps, frame_size):
+            self._fourcc = fourcc
+
+        def isOpened(self):
+            return False
+
+        def release(self):
+            return None
+
+    monkeypatch.setattr(replay.cv2, "VideoWriter_fourcc", lambda *chars: "".join(chars))
+    monkeypatch.setattr(replay.cv2, "VideoWriter", FakeWriter)
+
+    logger = logging.getLogger("codec_fail_test")
+    logger.handlers.clear()
+    logger.addHandler(logging.NullHandler())
+
+    with pytest.raises(RuntimeError, match="Tried codecs: avc1, H264, mp4v"):
+        replay._open_video_writer(
+            out_path=tmp_path / "out.mp4",
+            fps=8.0,
+            frame_size=(64, 64),
+            logger=logger,
+        )

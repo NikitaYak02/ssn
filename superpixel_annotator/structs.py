@@ -9,6 +9,7 @@ import io
 import gzip
 import tempfile
 import hashlib
+from collections import deque
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -101,6 +102,7 @@ def _sanitize_polygon(poly: Polygon, grid_size: float = 1e-9) -> Polygon:
 
 from skimage.filters import sobel
 from skimage.measure import find_contours
+from skimage.morphology import medial_axis, skeletonize
 from skimage.segmentation import felzenszwalb as sk_fz
 from skimage.segmentation import slic as sk_slic
 from skimage.segmentation import watershed as sk_ws
@@ -356,11 +358,31 @@ def _maybe_gaussian(img_u8: np.ndarray, sigma: float) -> np.ndarray:
     return img_u8
 
 
+def _normalize_bbox01(bbox: BBox) -> BBox:
+    x0, y0, x1, y1 = [float(v) for v in bbox]
+    x0, x1 = sorted((min(max(x0, 0.0), 1.0), min(max(x1, 0.0), 1.0)))
+    y0, y1 = sorted((min(max(y0, 0.0), 1.0), min(max(y1, 0.0), 1.0)))
+    return (x0, y0, x1, y1)
+
+
+def _bbox_to_pixel_rect(bbox: BBox, width: int, height: int) -> Tuple[int, int, int, int]:
+    x0, y0, x1, y1 = _normalize_bbox01(bbox)
+    ix0 = max(0, min(width, int(round(x0 * width))))
+    iy0 = max(0, min(height, int(round(y0 * height))))
+    ix1 = max(0, min(width, int(round(x1 * width))))
+    iy1 = max(0, min(height, int(round(y1 * height))))
+    return ix0, iy0, ix1, iy1
+
+
 def bbox_is_intersect(b1: BBox, b2: BBox) -> bool:
+    b1 = _normalize_bbox01(b1)
+    b2 = _normalize_bbox01(b2)
     return max(b1[0], b2[0]) <= min(b1[2], b2[2]) and max(b1[1], b2[1]) <= min(b1[3], b2[3])
 
 
 def bbox_intersect(b1: BBox, b2: BBox) -> BBox:
+    b1 = _normalize_bbox01(b1)
+    b2 = _normalize_bbox01(b2)
     return (max(b1[0], b2[0]), max(b1[1], b2[1]), min(b1[2], b2[2]), min(b1[3], b2[3]))
 
 
@@ -491,20 +513,22 @@ def parallel_stats_rgb(image: np.ndarray, mask: np.ndarray, max_label: int):
 
 
 def check_bbox_contain_scribble(polyline_points: np.ndarray, rectangles: List[List[float]]) -> bool:
-    """Каждый сегмент ломаной должен лежать хотя бы в одном прямоугольнике (в [0..1])."""
+    """Проверяет, что ломаная целиком покрыта объединением bbox-прямоугольников."""
     if polyline_points is None or len(polyline_points) < 2:
         return False
-    polygons = [Polygon([(a, b), (c, b), (c, d), (a, d)]) for a, b, c, d in rectangles]
+    polygons = []
+    for rect in rectangles:
+        a, b, c, d = _normalize_bbox01(tuple(rect))
+        if c <= a or d <= b:
+            continue
+        polygons.append(Polygon([(a, b), (c, b), (c, d), (a, d)]))
     if not polygons:
         return False
-    tree = STRtree(polygons)
     line = LineString(polyline_points)
-    for seg in zip(line.coords[:-1], line.coords[1:]):
-        seg_line = LineString(seg)
-        idxs = _strtree_query_indices(tree, seg_line)
-        if not any(polygons[i].contains(seg_line) for i in idxs):
-            return False
-    return True
+    try:
+        return bool(unary_union(polygons).covers(line))
+    except Exception:
+        return any(poly.covers(line) for poly in polygons)
 
 
 def find_holes(mask: np.ndarray) -> List[np.ndarray]:
@@ -886,6 +910,37 @@ def _edt_inside(mask: np.ndarray) -> np.ndarray:
     return dist[1:-1, 1:-1]
 
 
+def _smooth_region_mask(mask: np.ndarray, radius: int = 1) -> np.ndarray:
+    """
+    Smooth a binary region with explicit dilation/erosion passes.
+
+    The result is intended for geometric analysis of the region centerline; the
+    final scribble still stays inside the original allowed mask.
+    """
+    mask = np.asarray(mask, dtype=bool)
+    if radius <= 0 or not mask.any():
+        return mask.copy()
+
+    structure = np.ones((2 * int(radius) + 1, 2 * int(radius) + 1), dtype=bool)
+    closed = ndimage.binary_erosion(
+        ndimage.binary_dilation(mask, structure=structure, iterations=1),
+        structure=structure,
+        iterations=1,
+    )
+    opened = ndimage.binary_dilation(
+        ndimage.binary_erosion(closed, structure=structure, iterations=1),
+        structure=structure,
+        iterations=1,
+    )
+
+    min_keep = max(1, int(0.20 * float(np.count_nonzero(mask))))
+    if int(np.count_nonzero(opened)) >= min_keep:
+        return opened.astype(bool, copy=False)
+    if closed.any():
+        return closed.astype(bool, copy=False)
+    return mask.copy()
+
+
 def _split_disconnected_superpixels(labels: np.ndarray, mask: Optional[np.ndarray] = None) -> np.ndarray:
     """
     Ensure each label corresponds to exactly one connected component.
@@ -1018,6 +1073,7 @@ class LargestBadRegionGenerator:
     no_overlap: bool = True
     max_retries: int = 200
     center_quantile: float = 0.8
+    smoothing_radius: int = 1
 
     def __post_init__(self) -> None:
         self.gt = np.asarray(self.gt_mask, dtype=np.int32)
@@ -1026,6 +1082,7 @@ class LargestBadRegionGenerator:
         self.margin = max(0, int(self.margin))
         self.max_retries = max(1, int(self.max_retries))
         self.center_quantile = float(np.clip(self.center_quantile, 0.0, 1.0))
+        self.smoothing_radius = max(0, int(self.smoothing_radius))
         self._diag = 0.5 * float(np.hypot(self.W, self.H))
         self._gt_inner: List[np.ndarray] = []
         for cid in range(int(self.num_classes)):
@@ -1065,9 +1122,46 @@ class LargestBadRegionGenerator:
         if not region_mask.any():
             return None
         dist = _edt_inside(region_mask)
-        flat_idx = int(np.argmax(dist))
-        y0, x0 = np.unravel_index(flat_idx, dist.shape)
-        return int(x0), int(y0), dist
+        max_dt = float(dist.max())
+        if max_dt <= 0.0:
+            return None
+        ys, xs = np.where(dist >= (max_dt - 1e-6))
+        all_ys, all_xs = np.where(region_mask)
+        target_x = float(all_xs.mean())
+        target_y = float(all_ys.mean())
+        d2 = (xs.astype(np.float64) - target_x) ** 2 + (ys.astype(np.float64) - target_y) ** 2
+        idx = int(np.argmin(d2))
+        return int(xs[idx]), int(ys[idx]), dist
+
+    @staticmethod
+    def _nearest_allowed_point(
+        allowed_mask: np.ndarray,
+        x: float,
+        y: float,
+    ) -> Optional[Tuple[int, int]]:
+        ys, xs = np.where(allowed_mask)
+        if xs.size == 0:
+            return None
+        d2 = (xs.astype(np.float64) - float(x)) ** 2 + (ys.astype(np.float64) - float(y)) ** 2
+        idx = int(np.argmin(d2))
+        return int(xs[idx]), int(ys[idx])
+
+    def _analysis_region(self, allowed: np.ndarray, comp: np.ndarray) -> np.ndarray:
+        focus = allowed if allowed.any() else comp
+        if not focus.any():
+            return focus.copy()
+        smoothed = _smooth_region_mask(focus, radius=self.smoothing_radius)
+        labels, nlab = ndimage.label(smoothed)
+        if nlab <= 0:
+            return focus.copy()
+        counts = np.bincount(labels.ravel())
+        if counts.size <= 1:
+            return focus.copy()
+        counts[0] = 0
+        comp_idx = int(np.argmax(counts))
+        if counts[comp_idx] <= 0:
+            return focus.copy()
+        return labels == comp_idx
 
     def _principal_direction(
         self,
@@ -1113,6 +1207,325 @@ class LargestBadRegionGenerator:
             (0.0, 1.0),
         ]
 
+    def _segment_pixels(
+        self,
+        x0: int,
+        y0: int,
+        x1: int,
+        y1: int,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        n = max(abs(int(x1) - int(x0)), abs(int(y1) - int(y0))) + 1
+        xs = np.linspace(x0, x1, n).round().astype(np.int32)
+        ys = np.linspace(y0, y1, n).round().astype(np.int32)
+        xs = np.clip(xs, 0, self.W - 1)
+        ys = np.clip(ys, 0, self.H - 1)
+        return xs, ys
+
+    def _polyline_pixels(self, pts_px: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        pts_px = np.asarray(pts_px, dtype=np.int32)
+        if pts_px.ndim != 2 or pts_px.shape[0] == 0:
+            return np.zeros(0, dtype=np.int32), np.zeros(0, dtype=np.int32)
+        if pts_px.shape[0] == 1:
+            return pts_px[:, 0].copy(), pts_px[:, 1].copy()
+
+        xs_parts: List[np.ndarray] = []
+        ys_parts: List[np.ndarray] = []
+        for i in range(pts_px.shape[0] - 1):
+            xs, ys = self._segment_pixels(
+                int(pts_px[i, 0]),
+                int(pts_px[i, 1]),
+                int(pts_px[i + 1, 0]),
+                int(pts_px[i + 1, 1]),
+            )
+            if i > 0 and xs.size > 0:
+                xs = xs[1:]
+                ys = ys[1:]
+            xs_parts.append(xs)
+            ys_parts.append(ys)
+        return np.concatenate(xs_parts), np.concatenate(ys_parts)
+
+    def _nearest_mask_point(
+        self,
+        mask: np.ndarray,
+        x: float,
+        y: float,
+    ) -> Optional[Tuple[int, int]]:
+        return self._nearest_allowed_point(mask, x, y)
+
+    @staticmethod
+    def _simplify_polyline_pixels(pts_px: np.ndarray) -> np.ndarray:
+        pts_px = np.asarray(pts_px, dtype=np.int32)
+        if pts_px.ndim != 2 or pts_px.shape[0] <= 2:
+            return pts_px.copy()
+
+        deduped: List[np.ndarray] = [pts_px[0]]
+        for pt in pts_px[1:]:
+            if not np.array_equal(pt, deduped[-1]):
+                deduped.append(pt)
+        if len(deduped) <= 2:
+            return np.asarray(deduped, dtype=np.int32)
+
+        simplified: List[np.ndarray] = [deduped[0]]
+        for i in range(1, len(deduped) - 1):
+            a = simplified[-1]
+            b = deduped[i]
+            c = deduped[i + 1]
+            v1 = b - a
+            v2 = c - b
+            cross = int(v1[0]) * int(v2[1]) - int(v1[1]) * int(v2[0])
+            dot = int(v1[0]) * int(v2[0]) + int(v1[1]) * int(v2[1])
+            if cross == 0 and dot >= 0:
+                continue
+            simplified.append(b)
+        simplified.append(deduped[-1])
+        return np.asarray(simplified, dtype=np.int32)
+
+    @staticmethod
+    def _reconstruct_path(
+        prev: Dict[Tuple[int, int], Optional[Tuple[int, int]]],
+        end_xy: Tuple[int, int],
+    ) -> List[Tuple[int, int]]:
+        path: List[Tuple[int, int]] = []
+        cur: Optional[Tuple[int, int]] = end_xy
+        while cur is not None:
+            path.append(cur)
+            cur = prev.get(cur)
+        path.reverse()
+        return path
+
+    def _select_centerline_endpoint(
+        self,
+        nodes: List[Tuple[int, int]],
+        center_xy: Tuple[int, int],
+        axis_xy: Tuple[float, float],
+        dist_steps: Dict[Tuple[int, int], int],
+        dt_map: np.ndarray,
+        sign: float,
+    ) -> Tuple[int, int]:
+        cx, cy = center_xy
+        ax, ay = axis_xy
+        directed: List[Tuple[float, int, float, Tuple[int, int]]] = []
+        fallback: List[Tuple[int, float, float, Tuple[int, int]]] = []
+        for x, y in nodes:
+            if (x, y) == center_xy:
+                continue
+            dist = int(dist_steps.get((x, y), -1))
+            if dist < 0:
+                continue
+            proj = float(sign) * (
+                (float(x) - float(cx)) * float(ax) + (float(y) - float(cy)) * float(ay)
+            )
+            dt = float(dt_map[y, x]) if 0 <= x < self.W and 0 <= y < self.H else 0.0
+            fallback.append((dist, abs(proj), dt, (x, y)))
+            if proj > 0.0:
+                directed.append((proj, dist, dt, (x, y)))
+        if directed:
+            directed.sort(reverse=True)
+            return directed[0][3]
+        if fallback:
+            fallback.sort(reverse=True)
+            return fallback[0][3]
+        return center_xy
+
+    def _centerline_path_from_skeleton(
+        self,
+        skeleton: np.ndarray,
+        allowed: np.ndarray,
+        center_xy: Tuple[int, int],
+        axis_mask: np.ndarray,
+        dt_map: np.ndarray,
+    ) -> Optional[Tuple[np.ndarray, int, float]]:
+        if not skeleton.any():
+            return None
+
+        center_skel = self._nearest_mask_point(skeleton, center_xy[0], center_xy[1])
+        if center_skel is None:
+            return None
+
+        skel_labels, _ = ndimage.label(skeleton, structure=np.ones((3, 3), dtype=np.uint8))
+        label_id = int(skel_labels[center_skel[1], center_skel[0]])
+        if label_id <= 0:
+            return None
+        skel_comp = skel_labels == label_id
+
+        queue = deque([center_skel])
+        prev: Dict[Tuple[int, int], Optional[Tuple[int, int]]] = {center_skel: None}
+        dist_steps: Dict[Tuple[int, int], int] = {center_skel: 0}
+        degrees: Dict[Tuple[int, int], int] = {}
+
+        while queue:
+            cur_x, cur_y = queue.popleft()
+            deg = 0
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if dx == 0 and dy == 0:
+                        continue
+                    nx = cur_x + dx
+                    ny = cur_y + dy
+                    if not (0 <= nx < self.W and 0 <= ny < self.H):
+                        continue
+                    if not skel_comp[ny, nx]:
+                        continue
+                    deg += 1
+                    if (nx, ny) in prev:
+                        continue
+                    prev[(nx, ny)] = (cur_x, cur_y)
+                    dist_steps[(nx, ny)] = dist_steps[(cur_x, cur_y)] + 1
+                    queue.append((nx, ny))
+            degrees[(cur_x, cur_y)] = deg
+
+        nodes = list(prev.keys())
+        if len(nodes) <= 1:
+            return None
+
+        axis_xy = self._principal_direction(axis_mask, dt_map, center_xy[0], center_xy[1])[0]
+        endpoints = [node for node, deg in degrees.items() if deg <= 1 and node != center_skel]
+        endpoint_pool = endpoints if endpoints else [node for node in nodes if node != center_skel]
+        if not endpoint_pool:
+            return None
+
+        cx, cy = center_skel
+        ax, ay = axis_xy
+        endpoint_data: List[Tuple[List[Tuple[int, int]], int, Tuple[int, int], float]] = []
+        for end_xy in endpoint_pool:
+            path = self._reconstruct_path(prev, end_xy)
+            if len(path) <= 1:
+                continue
+            branch_key = path[1]
+            proj = (float(end_xy[0]) - float(cx)) * float(ax) + (float(end_xy[1]) - float(cy)) * float(ay)
+            endpoint_data.append((path, int(dist_steps.get(end_xy, -1)), branch_key, float(proj)))
+        if not endpoint_data:
+            return None
+
+        best_pair: Optional[Tuple[List[Tuple[int, int]], List[Tuple[int, int]]]] = None
+        best_pair_score: Optional[Tuple[int, int, float]] = None
+        for i in range(len(endpoint_data)):
+            path_i, dist_i, branch_i, proj_i = endpoint_data[i]
+            for j in range(i + 1, len(endpoint_data)):
+                path_j, dist_j, branch_j, proj_j = endpoint_data[j]
+                if branch_i == branch_j:
+                    continue
+                score = (
+                    int(dist_i + dist_j),
+                    int(min(dist_i, dist_j)),
+                    float(abs(proj_i - proj_j)),
+                )
+                if best_pair_score is None or score > best_pair_score:
+                    best_pair_score = score
+                    best_pair = (path_i, path_j)
+
+        if best_pair is not None:
+            path_a, path_b = best_pair
+            path_xy = list(reversed(path_a)) + path_b[1:]
+        else:
+            neg_end = self._select_centerline_endpoint(
+                endpoint_pool, center_skel, axis_xy, dist_steps, dt_map, sign=-1.0
+            )
+            pos_end = self._select_centerline_endpoint(
+                endpoint_pool, center_skel, axis_xy, dist_steps, dt_map, sign=+1.0
+            )
+            if neg_end == center_skel and pos_end == center_skel:
+                far_end = max(nodes, key=lambda node: dist_steps.get(node, -1))
+                if far_end == center_skel:
+                    return None
+                path_xy = self._reconstruct_path(prev, far_end)
+            else:
+                neg_path = self._reconstruct_path(prev, neg_end)
+                pos_path = self._reconstruct_path(prev, pos_end)
+                path_xy = list(reversed(neg_path)) + pos_path[1:]
+
+        pts_px = np.asarray(path_xy, dtype=np.int32)
+        if pts_px.shape[0] < 2:
+            return None
+
+        if not np.all(allowed[pts_px[:, 1], pts_px[:, 0]]):
+            _, nearest_allowed = ndimage.distance_transform_edt(~allowed, return_indices=True)
+            ys = pts_px[:, 1]
+            xs = pts_px[:, 0]
+            proj_y = nearest_allowed[0, ys, xs]
+            proj_x = nearest_allowed[1, ys, xs]
+            pts_px = np.stack([proj_x, proj_y], axis=1).astype(np.int32, copy=False)
+
+        pts_px = self._simplify_polyline_pixels(pts_px)
+        if pts_px.shape[0] < 2:
+            return None
+
+        center_allowed = self._nearest_mask_point(allowed, center_xy[0], center_xy[1])
+        if center_allowed is None:
+            return None
+        center_index = int(
+            np.argmin(
+                (pts_px[:, 0].astype(np.float64) - float(center_allowed[0])) ** 2
+                + (pts_px[:, 1].astype(np.float64) - float(center_allowed[1])) ** 2
+            )
+        )
+        seg = np.diff(pts_px.astype(np.float64), axis=0)
+        path_len = float(np.sum(np.sqrt((seg ** 2).sum(axis=1))))
+        return pts_px, center_index, path_len
+
+    def _build_centerline_path(
+        self,
+        allowed: np.ndarray,
+        analysis_mask: np.ndarray,
+    ) -> Optional[np.ndarray]:
+        source_mask = analysis_mask if analysis_mask.any() else allowed
+        if not source_mask.any():
+            return None
+
+        center_data = self._center_pixel(source_mask)
+        if center_data is None:
+            return None
+        cx, cy, center_dt = center_data
+        axis_mask = source_mask if source_mask.any() else allowed
+        max_dt = float(center_dt.max())
+
+        skeleton_candidates: List[np.ndarray] = []
+        seen_thresholds: set[float] = set()
+        for thr in [
+            max(1.0, 0.70 * max_dt),
+            max(1.0, 0.55 * max_dt),
+            max(1.0, 0.40 * max_dt),
+            1.0,
+        ]:
+            key = round(float(thr), 4)
+            if key in seen_thresholds:
+                continue
+            seen_thresholds.add(key)
+            ridge_mask = source_mask & (center_dt >= (float(thr) - 1e-6))
+            if not ridge_mask.any():
+                continue
+            skeleton_candidates.append(skeletonize(ridge_mask).astype(bool, copy=False))
+        skeleton_candidates.append(skeletonize(source_mask).astype(bool, copy=False))
+        skeleton_candidates.append(medial_axis(source_mask).astype(bool, copy=False))
+
+        best_pts: Optional[np.ndarray] = None
+        best_score = -1.0
+        for skeleton in skeleton_candidates:
+            path_choice = self._centerline_path_from_skeleton(
+                skeleton=skeleton,
+                allowed=allowed,
+                center_xy=(cx, cy),
+                axis_mask=axis_mask,
+                dt_map=center_dt,
+            )
+            if path_choice is None:
+                continue
+            pts_px, _, path_len = path_choice
+            xs, ys = self._polyline_pixels(pts_px)
+            if xs.size == 0:
+                continue
+            center_support = (
+                float(np.mean(center_dt[ys, xs])) / float(max(1e-6, max_dt))
+                if max_dt > 1e-6
+                else 0.0
+            )
+            score = float(path_len) + 0.5 * float(center_support)
+            if score <= best_score:
+                continue
+            best_score = score
+            best_pts = pts_px.astype(np.float32, copy=False)
+        return best_pts
+
     def _trace(
         self,
         x0: int,
@@ -1148,17 +1561,21 @@ class LargestBadRegionGenerator:
         dist_map: np.ndarray,
     ) -> Optional[np.ndarray]:
         best_pts: Optional[np.ndarray] = None
-        best_len = -1.0
+        best_score = -1.0
         directions = self._principal_direction(allowed, dist_map, x0, y0)
         for dx, dy in directions:
             x1a, y1a = self._trace(x0, y0, +dx, +dy, allowed, used_mask)
             x1b, y1b = self._trace(x0, y0, -dx, -dy, allowed, used_mask)
-            cur_len = float(np.hypot(x1a - x1b, y1a - y1b))
-            if cur_len <= best_len:
+            total_len = float(np.hypot(x1a - x1b, y1a - y1b))
+            arm_a = float(np.hypot(x1a - x0, y1a - y0))
+            arm_b = float(np.hypot(x1b - x0, y1b - y0))
+            balance = float(min(arm_a, arm_b) / max(1e-6, max(arm_a, arm_b)))
+            cur_score = total_len + 0.75 * balance
+            if cur_score <= best_score:
                 continue
-            best_len = cur_len
+            best_score = cur_score
             best_pts = np.array([[x1b, y1b], [x1a, y1a]], dtype=np.float32)
-        return best_pts if best_pts is not None and best_len > 0.0 else None
+        return best_pts if best_pts is not None and best_score > 0.0 else None
 
     def make_scribble(self, pred_mask: np.ndarray, used_mask: np.ndarray) -> Tuple[int, np.ndarray]:
         bad_mask = (np.asarray(pred_mask, dtype=np.int32) != self.gt)
@@ -1193,12 +1610,19 @@ class LargestBadRegionGenerator:
                 "Try --margin 0 or remove --no_overlap."
             )
 
-        center_data = self._center_pixel(allowed)
+        analysis_mask = self._analysis_region(allowed, comp)
+        center_data = self._center_pixel(analysis_mask if analysis_mask.any() else allowed)
         if center_data is None:
             raise RuntimeError("Failed to find a center pixel for the bad region.")
         x0, y0, dist_map = center_data
+        projected_center = self._nearest_allowed_point(allowed, x0, y0)
+        if projected_center is None:
+            raise RuntimeError("Failed to project the scribble center to the allowed region.")
+        x0, y0 = projected_center
 
-        pts = self._best_segment(x0, y0, allowed, np.asarray(used_mask, dtype=bool), dist_map)
+        pts = self._build_centerline_path(allowed, analysis_mask)
+        if pts is None:
+            pts = self._best_segment(x0, y0, allowed, np.asarray(used_mask, dtype=bool), dist_map)
         if pts is None:
             ys, xs = np.where(allowed)
             for _ in range(self.max_retries):
@@ -1290,12 +1714,16 @@ def compute_superpixels(
     image_lab — float ndarray (H,W,3) в Lab.
     """
     H, W = image_lab.shape[:2]
+    if H == 0 or W == 0:
+        return np.zeros((H, W), dtype=np.int32)
     num_pixel_in_roi = H * W
     sp_size = 1400 * 1400 / 500
     n_segment_dynamic = num_pixel_in_roi // sp_size
     has_mask = mask is not None
     if has_mask:
         mask = mask.astype(bool)
+        if not np.any(mask):
+            return np.zeros((H, W), dtype=np.int32)
 
     # --- SLIC ---
     if isinstance(method, SLICSuperpixel):
@@ -1468,6 +1896,7 @@ class SuperPixelAnnotationAlgo:
         # already annotated regions (list of normalized bbox)
         self.annotated_bbox: List[List[float]] = []
         self.bbox_size: int = 700
+        self.refine_bbox_size: int = 256
         self._property_dist = 5.0
         self._superpixel_radius = 0.08  # in normalized coords (KD radius)
         self.auto_propagation_sensitivity = float(auto_propagation_sensitivity)
@@ -1563,8 +1992,11 @@ class SuperPixelAnnotationAlgo:
         mask: np.ndarray,
         bbox: List[float],
         scribble: Scribble,  # kept for future hooks
-    ):
+        forbidden_bboxes: Optional[List[List[float]]] = None,
+    ) -> int:
         self._ensure_embedding_defaults_for_method(superpixel_method)
+        if image_roi.size == 0 or mask.size == 0 or not np.any(mask):
+            return 0
         sp_mask = compute_superpixels(
             image_roi,
             superpixel_method,
@@ -1572,7 +2004,7 @@ class SuperPixelAnnotationAlgo:
             embedding_guided_cleanup=bool(self.embedding_weight_path),
         )
         if sp_mask.size == 0:
-            return
+            return 0
         means, variances, valid_labels = parallel_stats_rgb(
             image_roi.astype(np.float32, copy=False), sp_mask, int(np.max(sp_mask))
         )
@@ -1601,12 +2033,42 @@ class SuperPixelAnnotationAlgo:
             except Exception as _emb_err:
                 logger.warning("Embedding computation failed (skipping emb for this ROI): %s", _emb_err)
 
+        allowed_geom = None
+        if forbidden_bboxes:
+            try:
+                x0, y0, x1, y1 = _normalize_bbox01(tuple(bbox))
+                roi_poly = Polygon([(x0, y0), (x1, y0), (x1, y1), (x0, y1)])
+                forbid_polys = []
+                for fb in forbidden_bboxes:
+                    fx0, fy0, fx1, fy1 = _normalize_bbox01(tuple(fb))
+                    if fx1 <= fx0 or fy1 <= fy0:
+                        continue
+                    forbid_polys.append(Polygon([(fx0, fy0), (fx1, fy0), (fx1, fy1), (fx0, fy1)]))
+                if forbid_polys:
+                    allowed_geom = roi_poly.difference(unary_union(forbid_polys))
+            except Exception as clip_err:
+                logger.warning("Failed to build allowed ROI geometry: %s", clip_err)
+                allowed_geom = None
+
+        created_count = 0
         for i, lab in enumerate(valid_labels):
             if lab <= 0:
                 continue
             polygon = polys.get(int(lab))
             if polygon is None or len(polygon) < 3:
                 continue
+            if allowed_geom is not None:
+                try:
+                    clipped = Polygon(polygon).intersection(allowed_geom)
+                    clipped_poly = _largest_polygon(_sanitize_polygon(clipped))
+                except Exception as clip_err:
+                    logger.warning("Failed to clip ROI polygon to allowed bbox area: %s", clip_err)
+                    continue
+                if clipped_poly is None or clipped_poly.is_empty or clipped_poly.area < 1e-8:
+                    continue
+                polygon = np.asarray(clipped_poly.exterior.coords, dtype=np.float32)
+                if polygon.ndim != 2 or polygon.shape[0] < 3:
+                    continue
             region_props = []
             region_props.extend(means[i])
             region_props.extend(variances[i])
@@ -1621,7 +2083,32 @@ class SuperPixelAnnotationAlgo:
                 )
             )
             self._superpixel_ind[superpixel_method] += 1
+            created_count += 1
         self._mark_sp_index_dirty()
+        return created_count
+
+    def _rasterize_scribble_to_roi_mask(
+        self,
+        scribble: Scribble,
+        roi: Tuple[int, int, int, int],
+        *,
+        width_px: int,
+    ) -> Optional[np.ndarray]:
+        if len(scribble.points) < 2:
+            return None
+        x0, y0, x1, y1 = roi
+        w, h = x1 - x0, y1 - y0
+        if w <= 0 or h <= 0:
+            return None
+        H, W = self.image_lab.shape[:2]
+        pts = np.asarray(scribble.points, dtype=np.float32)
+        pts_px = np.empty_like(pts)
+        pts_px[:, 0] = pts[:, 0] * W - x0
+        pts_px[:, 1] = pts[:, 1] * H - y0
+        canvas = Image.new("L", (w, h), 0)
+        draw = ImageDraw.Draw(canvas)
+        draw.line([tuple(p) for p in pts_px], fill=1, width=max(1, int(width_px)))
+        return np.array(canvas, dtype=bool)
 
     def _create_superpixel_for_scribble(self, scribble: Scribble, superpixel_method: SuperPixelMethod) -> None:
         self._ensure_embedding_defaults_for_method(superpixel_method)
@@ -1634,48 +2121,80 @@ class SuperPixelAnnotationAlgo:
 
         if len(scribble) < 2:
             return
-        if self._exist_sp_mask(scribble):
-            return
+        already_covered = self._exist_sp_mask(scribble)
 
-        # нормированный bbox around scribble with padding (bbox_size)
+        # Allow local refinement even inside an old bbox. In that case we use a
+        # smaller ROI and avoid subtracting the containing bbox, otherwise later
+        # scribbles often fail to create any new local superpixels at all.
         H, W = self.image_lab.shape[:2]
         pts = scribble.points
         bbox = [float(pts[:, 0].min()), float(pts[:, 1].min()),
                 float(pts[:, 0].max()), float(pts[:, 1].max())]
-        pad_x = 1.0 * self.bbox_size / (2 * W)
-        pad_y = 1.0 * self.bbox_size / (2 * H)
-        bbox = [
+        local_bbox_size = self.refine_bbox_size if already_covered else self.bbox_size
+        pad_x = 1.0 * local_bbox_size / (2 * W)
+        pad_y = 1.0 * local_bbox_size / (2 * H)
+        bbox = list(_normalize_bbox01((
             max(bbox[0] - pad_x, 0.0),
             max(bbox[1] - pad_y, 0.0),
             min(bbox[2] + pad_x, 1.0),
             min(bbox[3] + pad_y, 1.0),
-        ]
+        )))
 
         x0, y0, x1, y1 = bbox
-        ix0, iy0, ix1, iy1 = int(round(x0 * W)), int(round(y0 * H)), int(round(x1 * W)), int(round(y1 * H))
-        ix0, iy0 = max(ix0, 0), max(iy0, 0)
-        ix1, iy1 = min(ix1, W), min(iy1, H)
+        ix0, iy0, ix1, iy1 = _bbox_to_pixel_rect(tuple(bbox), W, H)
         if ix1 <= ix0 or iy1 <= iy0:
             return
+        roi_px = (ix0, iy0, ix1, iy1)
         image_roi = self.image_lab[iy0:iy1, ix0:ix1]
         mask = np.ones((image_roi.shape[0], image_roi.shape[1]), dtype=bool)
+        scribble_line = LineString(scribble.points)
+        forbidden_bboxes: List[List[float]] = []
 
         # вычитаем пересечение уже размеченных bbox
         for existed_bbox in self.annotated_bbox:
+            existed_bbox = list(_normalize_bbox01(tuple(existed_bbox)))
+            existed_poly = Polygon([
+                (existed_bbox[0], existed_bbox[1]),
+                (existed_bbox[2], existed_bbox[1]),
+                (existed_bbox[2], existed_bbox[3]),
+                (existed_bbox[0], existed_bbox[3]),
+            ])
+            if already_covered and existed_poly.covers(scribble_line):
+                continue
             if not bbox_is_intersect(tuple(existed_bbox), tuple(bbox)):
                 continue
-            inter = bbox_intersect(tuple(existed_bbox), tuple(bbox))
-            jx0 = int((inter[0] - x0) * W)
-            jy0 = int((inter[1] - y0) * H)
-            jx1 = int((inter[2] - x0) * W)
-            jy1 = int((inter[3] - y0) * H)
+            ex_ix0, ex_iy0, ex_ix1, ex_iy1 = _bbox_to_pixel_rect(tuple(existed_bbox), W, H)
+            jx0 = max(ix0, ex_ix0) - ix0
+            jy0 = max(iy0, ex_iy0) - iy0
+            jx1 = min(ix1, ex_ix1) - ix0
+            jy1 = min(iy1, ex_iy1) - iy0
             jx0, jy0 = max(jx0, 0), max(jy0, 0)
             jx1, jy1 = min(jx1, image_roi.shape[1]), min(jy1, image_roi.shape[0])
             if jx1 > jx0 and jy1 > jy0:
                 mask[jy0:jy1, jx0:jx1] = 0
+                forbidden_bboxes.append(existed_bbox)
 
-        self.annotated_bbox.append(bbox)
-        self._create_superpixel_for_mask(superpixel_method, image_roi, mask, bbox, scribble)
+        if already_covered:
+            scribble_radius = int(getattr(scribble.params, "radius", 1))
+            scribble_mask = self._rasterize_scribble_to_roi_mask(
+                scribble,
+                roi_px,
+                width_px=max(3, 2 * scribble_radius + 1),
+            )
+            if scribble_mask is not None:
+                mask |= scribble_mask
+
+
+        created_count = self._create_superpixel_for_mask(
+            superpixel_method,
+            image_roi,
+            mask,
+            bbox,
+            scribble,
+            forbidden_bboxes=forbidden_bboxes if not already_covered else None,
+        )
+        if created_count > 0:
+            self.annotated_bbox.append(bbox)
 
     def _create_superpixel(self, superpixel_method: SuperPixelMethod) -> None:
         self._superpixel_ind[superpixel_method] = 0
@@ -2232,12 +2751,40 @@ class SuperPixelAnnotationAlgo:
                 return True
         return False
 
-    def use_sensitivity_for_region(self, sp_idx: int, sens: float, scribble: Scribble) -> None:
+    def _find_annotation_for_superpixel(
+        self,
+        sp_id: int,
+        sp_method: SuperPixelMethod,
+    ) -> tuple[Optional[int], Optional[AnnotationInstance]]:
+        ann_obj = self._annotations.get(sp_method)
+        if ann_obj is None:
+            return None, None
+        for idx, anno in enumerate(ann_obj.annotations):
+            if int(anno.parent_superpixel) == int(sp_id):
+                return idx, anno
+        return None, None
+
+    @staticmethod
+    def _is_split_descendant(sp: SuperPixel) -> bool:
+        return bool(getattr(sp, "parents", None))
+
+    def use_sensitivity_for_region(
+        self,
+        sp_idx: int,
+        sens: float,
+        scribble: Scribble,
+        *,
+        radius_scale: float = 1.0,
+        property_scale: float = 1.0,
+        embedding_threshold_override: Optional[float] = None,
+    ) -> None:
         """
         Безопасное расширение аннотации по соседям:
         - работает ТОЛЬКО в главном потоке (вызывается снаружи после merge)
         - не трогает суперпиксели, пересекающиеся с ЛЮБЫМИ штрихами другого класса
         - parent_intersect выставляется по факту buffered-пересечения с родительским штрихом
+        - топологическое ограничение по расстоянию между полигонами не применяется:
+          распространение контролируется пространственным радиусом и feature-gate
         """
         if not self.superpixel_methods:
             return
@@ -2266,10 +2813,15 @@ class SuperPixelAnnotationAlgo:
         seed_code = int(scribble.params.code)
         seed_line_buf = LineString(scribble.points).buffer(buf, cap_style=2, join_style=2)
 
-        radius = float(self._superpixel_radius * max(0.0, sens))
+        radius = float(self._superpixel_radius * max(0.0, sens) * max(0.0, radius_scale))
         seed_sp = self.superpixels[sp_method][sp_idx]
         seed_props = seed_sp.props
         proto_emb = self._compute_code_embedding_prototype(sp_method, int(scribble.params.code))
+        emb_threshold = (
+            float(embedding_threshold_override)
+            if embedding_threshold_override is not None
+            else float(self._embedding_threshold)
+        )
         ref_emb = None
         if proto_emb is not None and seed_sp.emb is not None:
             merged = 0.5 * (np.asarray(proto_emb, dtype=np.float32) + np.asarray(seed_sp.emb, dtype=np.float32))
@@ -2285,7 +2837,6 @@ class SuperPixelAnnotationAlgo:
 
         while queue:
             cur = queue.pop()
-            cur_sp = self.superpixels[sp_method][cur]
             cur_pt = np.array(self._sp_centroids[cur])
 
             # соседи по центроидам
@@ -2306,39 +2857,53 @@ class SuperPixelAnnotationAlgo:
                 if conflict:
                     continue
 
-                # 2) Топологическая близость
-                if cur_sp.poly.distance(cand_poly) > 0.0001 * sens:
-                    continue
-
-                # 3) Сходство признаков — эмбединги (если есть) или LAB props
+                # 2) Сходство признаков — эмбединги (если есть) или LAB props
                 if ref_emb is not None and cand_sp.emb is not None:
                     # cosine similarity against the class prototype / seed mean embedding
                     cos_sim = float(np.dot(ref_emb, cand_sp.emb))
-                    if cos_sim < self._embedding_threshold:
+                    if cos_sim < emb_threshold:
                         continue
                 else:
                     if cand_sp.props is None or seed_props is None:
                         continue
-                    if not np.all(np.abs(cand_sp.props - seed_props) < self._property_dist * sens):
+                    if not np.all(
+                        np.abs(cand_sp.props - seed_props)
+                        < (self._property_dist * sens * max(0.0, property_scale))
+                    ):
                         continue
 
-                # 4) Аннотирование
+                # 3) Аннотирование
                 parent_intersect = cand_poly.intersects(seed_line_buf)
 
-                if self.sp_annotated_before(cand_sp.id, sp_method):
+                anno_idx, anno_obj = self._find_annotation_for_superpixel(int(cand_sp.id), sp_method)
+                if anno_obj is not None:
+                    # Directly scribbled / intersected regions stay "hard". Areas
+                    # produced only by previous propagation can be reused as a
+                    # target and recolored by the new propagation pass.
+                    if bool(anno_obj.parent_intersect):
+                        visited.add(nb)
+                        continue
+
+                    prev_sids = [int(s) for s in (anno_obj.parent_scribble or [])]
+                    if int(scribble.id) not in prev_sids:
+                        prev_sids.append(int(scribble.id))
+                    anno_obj.code = seed_code
+                    anno_obj.parent_scribble = prev_sids
+                    anno_obj.parent_intersect = bool(parent_intersect)
                     visited.add(nb)
                     continue
-                self._annotations[sp_method].annotations.append(
-                    AnnotationInstance(
-                        id=self._annotation_ind[sp_method],
-                        code=seed_code,
-                        border=cand_sp.border.astype(np.float32),
-                        parent_superpixel=int(cand_sp.id),
-                        parent_scribble=[scribble.id],
-                        parent_intersect=bool(parent_intersect),
+                else:
+                    self._annotations[sp_method].annotations.append(
+                        AnnotationInstance(
+                            id=self._annotation_ind[sp_method],
+                            code=seed_code,
+                            border=cand_sp.border.astype(np.float32),
+                            parent_superpixel=int(cand_sp.id),
+                            parent_scribble=[scribble.id],
+                            parent_intersect=bool(parent_intersect),
+                        )
                     )
-                )
-                self._annotation_ind[sp_method] += 1
+                    self._annotation_ind[sp_method] += 1
                 visited.add(nb)
                 queue.append(nb)
 
@@ -2423,6 +2988,28 @@ class SuperPixelAnnotationAlgo:
 
                 # РАЗНЫЙ класс + пересечение (буфером) => сплит
                 if does_intersect:
+                    # Do not geometrically split the same region twice. If the
+                    # current superpixel is already a child produced by a
+                    # previous split, treat a new direct scribble as relabeling
+                    # that refined piece instead of creating second-level
+                    # fragments.
+                    if self._is_split_descendant(cur_superpixel):
+                        new_anno = AnnotationInstance(
+                            id=-1,
+                            code=last_scribble.params.code,
+                            border=anno_obj.border,
+                            parent_superpixel=anno_obj.parent_superpixel,
+                            parent_scribble=[int(last_scribble.id)],
+                            parent_intersect=True,
+                        )
+                        return _CandResult(
+                            superpixel_ind_to_del=[],
+                            annotations_to_del=[base_anno_ind],
+                            superpixel_to_append=[],
+                            scribbles_to_check=[],
+                            new_annotations=[new_anno],
+                            update_existing_annos=[]
+                        )
                     if anno_obj.parent_intersect == False:
                         new_anno = AnnotationInstance(
                             id=-1,
@@ -2515,12 +3102,9 @@ class SuperPixelAnnotationAlgo:
                                     id=-1,
                                     method=superpixel_method.short_string(),
                                     border=np.around(coords, 7),
-                                    parents=[cur_superpixel.id],
+                                    parents=list((cur_superpixel.parents or [])) + [cur_superpixel.id],
                                     props=props_arr
                                 ))
-                                # print(i_lbl, len(tmp))
-                                if (i_lbl > len(tmp)):
-                                    print(i_lbl, len(tmp))
 
                         # проверка: один кусок — коды штрихов не смешиваются
                         def _check_non_overlap_by_classes(scribble_ids: List[int], regions: List[SuperPixel]) -> bool:
@@ -2553,7 +3137,6 @@ class SuperPixelAnnotationAlgo:
                     # fallback split по самой линии
                     if (not tmp) or (not is_ok):
                         try:
-                            print("strange\n")
                             pieces = shp_split(sp_poly.buffer(0), scribble_line)
                             tmp = []
                             if getattr(pieces, "geoms", None) and len(pieces.geoms) >= 2:
@@ -2576,7 +3159,7 @@ class SuperPixelAnnotationAlgo:
                                         id=-1,
                                         method=superpixel_method.short_string(),
                                         border=np.around(coords, 7),
-                                        parents=[cur_superpixel.id],
+                                        parents=list((cur_superpixel.parents or [])) + [cur_superpixel.id],
                                         props=props_arr
                                     ))
                             else:
