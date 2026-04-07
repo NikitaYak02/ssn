@@ -101,7 +101,7 @@ def _sanitize_polygon(poly: Polygon, grid_size: float = 1e-9) -> Polygon:
     return out
 
 from skimage.filters import sobel
-from skimage.measure import find_contours
+from skimage.measure import find_contours, label as sk_label
 from skimage.morphology import medial_axis, skeletonize
 from skimage.segmentation import felzenszwalb as sk_fz
 from skimage.segmentation import slic as sk_slic
@@ -946,37 +946,77 @@ def _split_disconnected_superpixels(labels: np.ndarray, mask: Optional[np.ndarra
     Ensure each label corresponds to exactly one connected component.
     Disconnected islands of the same label get new unique ids.
     """
+    work = np.asarray(labels, dtype=np.int32)
+    if mask is not None:
+        mask_bool = np.asarray(mask, dtype=bool)
+        work = np.where(mask_bool, work, 0)
+    if not np.any(work > 0):
+        return np.zeros_like(work, dtype=np.int32)
+    return sk_label(work, connectivity=1, background=0).astype(np.int32, copy=False)
+
+
+def _build_label_adjacency(
+    labels: np.ndarray,
+    mask: Optional[np.ndarray] = None,
+) -> Dict[int, Dict[int, int]]:
+    """
+    Count shared 4-neighbour boundary length between adjacent labels.
+    """
     labels = np.asarray(labels, dtype=np.int32)
-    out = np.zeros_like(labels, dtype=np.int32)
-    next_id = 1
     valid = labels > 0
     if mask is not None:
         valid &= np.asarray(mask, dtype=bool)
-    uniq = [int(v) for v in np.unique(labels[valid]) if int(v) > 0]
-    for lab in uniq:
-        comp_mask = valid & (labels == lab)
-        cc, ncc = ndimage.label(comp_mask)
-        for k in range(1, int(ncc) + 1):
-            out[cc == k] = next_id
-            next_id += 1
-    return out
+
+    adjacency: Dict[int, Dict[int, int]] = {
+        int(lab): {}
+        for lab in np.unique(labels[valid])
+        if int(lab) > 0
+    }
+    if not valid.any():
+        return adjacency
+
+    def add_edges(lhs: np.ndarray, rhs: np.ndarray, pair_valid: np.ndarray) -> None:
+        edge_mask = pair_valid & (lhs > 0) & (rhs > 0) & (lhs != rhs)
+        if not edge_mask.any():
+            return
+        pairs = np.stack([lhs[edge_mask], rhs[edge_mask]], axis=1).astype(np.int32, copy=False)
+        pairs.sort(axis=1)
+        unique_pairs, counts = np.unique(pairs, axis=0, return_counts=True)
+        for (u, v), count in zip(unique_pairs, counts):
+            uu = int(u)
+            vv = int(v)
+            ww = int(count)
+            adjacency.setdefault(uu, {})
+            adjacency.setdefault(vv, {})
+            adjacency[uu][vv] = adjacency[uu].get(vv, 0) + ww
+            adjacency[vv][uu] = adjacency[vv].get(uu, 0) + ww
+
+    add_edges(labels[:, :-1], labels[:, 1:], valid[:, :-1] & valid[:, 1:])
+    add_edges(labels[:-1, :], labels[1:, :], valid[:-1, :] & valid[1:, :])
+    return adjacency
 
 
-def _filter_small_and_thin_superpixels(
+def _merge_small_and_thin_superpixels(
     labels: np.ndarray,
     nspix_hint: int,
     mask: Optional[np.ndarray] = None,
     min_area_ratio: float = 0.02,
     thin_radius_px: float = 1.5,
+    max_passes: int = 4,
 ) -> np.ndarray:
     """
-    Mark very small or very thin superpixel components as background (0).
+    Merge very small or very thin superpixels into their strongest neighbour.
+
+    The merge is based on the shared boundary length, with a preference for
+    neighbours that are not themselves marked as too small / too thin.
     """
     labels = np.asarray(labels, dtype=np.int32).copy()
     valid = labels > 0
+    mask_bool: Optional[np.ndarray] = None
     if mask is not None:
-        valid &= np.asarray(mask, dtype=bool)
-        labels[~np.asarray(mask, dtype=bool)] = 0
+        mask_bool = np.asarray(mask, dtype=bool)
+        valid &= mask_bool
+        labels[~mask_bool] = 0
 
     if not valid.any():
         return labels
@@ -984,14 +1024,103 @@ def _filter_small_and_thin_superpixels(
     approx_segment_area = max(1.0, float(np.count_nonzero(valid)) / float(max(1, nspix_hint)))
     min_area = max(8, int(round(min_area_ratio * approx_segment_area)))
 
-    for lab in [int(v) for v in np.unique(labels[valid]) if int(v) > 0]:
-        comp = (labels == lab)
-        area = int(np.count_nonzero(comp))
-        if area == 0:
-            continue
-        max_radius = float(_edt_inside(comp).max()) if comp.any() else 0.0
-        if area < min_area or max_radius < float(thin_radius_px):
-            labels[comp] = 0
+    def _measure_label(
+        lab: int,
+        label_slices: Sequence[Optional[Tuple[slice, ...]]],
+    ) -> Tuple[int, float, Optional[Tuple[slice, ...]]]:
+        idx = int(lab) - 1
+        if idx < 0 or idx >= len(label_slices):
+            return 0, 0.0, None
+        sl = label_slices[idx]
+        if sl is None:
+            return 0, 0.0, None
+
+        comp_local = labels[sl] == int(lab)
+        if mask_bool is not None:
+            comp_local &= mask_bool[sl]
+        area = int(np.count_nonzero(comp_local))
+        if area <= 0:
+            return 0, 0.0, sl
+        if area < min_area:
+            return area, 0.0, sl
+        radius = float(_edt_inside(comp_local).max()) if comp_local.any() else 0.0
+        return area, radius, sl
+
+    for _ in range(max(1, int(max_passes))):
+        current_valid = labels > 0
+        if mask_bool is not None:
+            current_valid &= mask_bool
+        label_ids = [int(v) for v in np.unique(labels[current_valid]) if int(v) > 0]
+        if not label_ids:
+            break
+
+        label_slices = ndimage.find_objects(labels, max_label=int(labels.max()))
+        stats: Dict[int, Tuple[int, float]] = {}
+        label_boxes: Dict[int, Tuple[slice, ...]] = {}
+        for lab in label_ids:
+            area, max_radius, sl = _measure_label(lab, label_slices)
+            if area <= 0:
+                continue
+            stats[lab] = (area, max_radius)
+            if sl is not None:
+                label_boxes[lab] = sl
+
+        bad_labels = {
+            lab
+            for lab, (area, max_radius) in stats.items()
+            if area < min_area or max_radius < float(thin_radius_px)
+        }
+        if not bad_labels:
+            break
+
+        adjacency = _build_label_adjacency(labels, mask=mask_bool)
+        changed = False
+        for lab in sorted(bad_labels, key=lambda item: (stats[item][0], stats[item][1], item)):
+            current_area, current_radius, sl = _measure_label(lab, label_slices)
+            if current_area <= 0 or sl is None:
+                continue
+            if current_area >= min_area and current_radius >= float(thin_radius_px):
+                continue
+
+            neighbor_votes = adjacency.get(lab, {})
+            if not neighbor_votes:
+                continue
+
+            preferred_neighbors = [
+                (neighbor, weight)
+                for neighbor, weight in neighbor_votes.items()
+                if neighbor not in bad_labels and int(stats.get(int(neighbor), (0, 0.0))[0]) > 0
+            ]
+            candidate_neighbors = preferred_neighbors or [
+                (neighbor, weight)
+                for neighbor, weight in neighbor_votes.items()
+                if int(stats.get(int(neighbor), (0, 0.0))[0]) > 0
+            ]
+            if not candidate_neighbors:
+                continue
+
+            best_label = max(
+                candidate_neighbors,
+                key=lambda item: (
+                    int(item[1]),
+                    int(stats.get(int(item[0]), (0, 0.0))[0]),
+                    float(stats.get(int(item[0]), (0, 0.0))[1]),
+                    -int(item[0]),
+                ),
+            )[0]
+            local_labels = labels[sl]
+            local_labels[local_labels == int(lab)] = int(best_label)
+            labels[sl] = local_labels
+            best_area, best_radius = stats.get(int(best_label), (0, 0.0))
+            stats[int(best_label)] = (
+                int(best_area) + int(current_area),
+                max(float(best_radius), float(current_radius)),
+            )
+            stats[int(lab)] = (0, 0.0)
+            changed = True
+
+        if not changed:
+            break
 
     return labels
 
@@ -1017,13 +1146,13 @@ def _postprocess_superpixel_labels(
     """
     Connectivity-aware cleanup for superpixel labels:
     1. Split disconnected regions into different superpixels.
-    2. Optionally drop very small or thin regions to background.
-    3. Split again if background removal disconnected regions further.
+    2. Optionally merge very small or thin regions into adjacent superpixels.
+    3. Split again if the merge introduced a disconnected label.
     4. Relabel sequentially.
     """
     labels = _split_disconnected_superpixels(labels, mask=mask)
     if prune_small_thin:
-        labels = _filter_small_and_thin_superpixels(labels, nspix_hint=nspix_hint, mask=mask)
+        labels = _merge_small_and_thin_superpixels(labels, nspix_hint=nspix_hint, mask=mask)
         labels = _split_disconnected_superpixels(labels, mask=mask)
     labels = _relabel_sequential(labels, mask=mask)
     if mask is not None:
@@ -1161,7 +1290,11 @@ class LargestBadRegionGenerator:
         comp_idx = int(np.argmax(counts))
         if counts[comp_idx] <= 0:
             return focus.copy()
-        return labels == comp_idx
+        largest = labels == comp_idx
+        min_keep = max(2, int(0.65 * float(np.count_nonzero(focus))))
+        if int(np.count_nonzero(largest)) >= min_keep:
+            return largest
+        return focus.copy()
 
     def _principal_direction(
         self,
@@ -1206,6 +1339,80 @@ class LargestBadRegionGenerator:
             (1.0, 0.0),
             (0.0, 1.0),
         ]
+
+    @staticmethod
+    def _normalized_dt_map(dist_map: np.ndarray) -> np.ndarray:
+        max_dt = float(np.max(dist_map))
+        if max_dt <= 1e-6:
+            return np.zeros_like(dist_map, dtype=np.float32)
+        return np.clip(dist_map.astype(np.float32) / float(max_dt), 0.0, 1.0)
+
+    def _edt_corridor_masks(
+        self,
+        allowed: np.ndarray,
+        dist_map: np.ndarray,
+    ) -> List[np.ndarray]:
+        allowed = np.asarray(allowed, dtype=bool)
+        if not allowed.any():
+            return []
+
+        allowed_vals = dist_map[allowed]
+        max_dt = float(np.max(allowed_vals)) if allowed_vals.size > 0 else 0.0
+        if max_dt <= 1e-6:
+            return [allowed.copy()]
+
+        norm_dt = self._normalized_dt_map(dist_map)
+        strict_interior = allowed & (dist_map > (1.0 + 1e-6))
+        corridor_base = strict_interior if strict_interior.any() else allowed
+        corridor = corridor_base & (norm_dt >= (0.40 - 1e-6))
+
+        masks: List[np.ndarray] = []
+        if corridor.any():
+            masks.append(corridor)
+        elif corridor_base.any():
+            masks.append(corridor_base)
+
+        plateau = allowed & (dist_map >= (max_dt - 1e-6))
+        if plateau.any():
+            masks.append(plateau)
+        return masks
+
+    def _build_scribble_core(
+        self,
+        allowed: np.ndarray,
+        dist_map: np.ndarray,
+    ) -> np.ndarray:
+        if not allowed.any():
+            return allowed
+
+        min_pixels = max(6, int(0.03 * float(np.count_nonzero(allowed))))
+        best_core: Optional[np.ndarray] = None
+        best_size = -1
+
+        for core in self._edt_corridor_masks(allowed, dist_map):
+            if not core.any():
+                continue
+            labels, nlab = ndimage.label(core)
+            if nlab <= 0:
+                continue
+            counts = np.bincount(labels.ravel())
+            if counts.size <= 1:
+                continue
+            counts[0] = 0
+            comp_idx = int(np.argmax(counts))
+            if counts[comp_idx] <= 0:
+                continue
+            core_largest = labels == comp_idx
+            cur_size = int(np.count_nonzero(core_largest))
+            if cur_size > best_size:
+                best_size = cur_size
+                best_core = core_largest
+            if cur_size >= min_pixels:
+                return core_largest
+
+        if best_core is not None and best_core.any():
+            return best_core
+        return allowed & (dist_map >= (float(dist_map.max()) - 1e-6))
 
     def _segment_pixels(
         self,
@@ -1479,31 +1686,19 @@ class LargestBadRegionGenerator:
         axis_mask = source_mask if source_mask.any() else allowed
         max_dt = float(center_dt.max())
 
-        skeleton_candidates: List[np.ndarray] = []
-        seen_thresholds: set[float] = set()
-        for thr in [
-            max(1.0, 0.70 * max_dt),
-            max(1.0, 0.55 * max_dt),
-            max(1.0, 0.40 * max_dt),
-            1.0,
-        ]:
-            key = round(float(thr), 4)
-            if key in seen_thresholds:
-                continue
-            seen_thresholds.add(key)
-            ridge_mask = source_mask & (center_dt >= (float(thr) - 1e-6))
+        skeleton_candidates: List[Tuple[np.ndarray, np.ndarray]] = []
+        for ridge_mask in self._edt_corridor_masks(source_mask, center_dt):
             if not ridge_mask.any():
                 continue
-            skeleton_candidates.append(skeletonize(ridge_mask).astype(bool, copy=False))
-        skeleton_candidates.append(skeletonize(source_mask).astype(bool, copy=False))
-        skeleton_candidates.append(medial_axis(source_mask).astype(bool, copy=False))
+            skeleton_candidates.append((skeletonize(ridge_mask).astype(bool, copy=False), ridge_mask))
+            skeleton_candidates.append((medial_axis(ridge_mask).astype(bool, copy=False), ridge_mask))
 
         best_pts: Optional[np.ndarray] = None
         best_score = -1.0
-        for skeleton in skeleton_candidates:
+        for skeleton, corridor_mask in skeleton_candidates:
             path_choice = self._centerline_path_from_skeleton(
                 skeleton=skeleton,
-                allowed=allowed,
+                allowed=corridor_mask,
                 center_xy=(cx, cy),
                 axis_mask=axis_mask,
                 dt_map=center_dt,
@@ -1615,16 +1810,24 @@ class LargestBadRegionGenerator:
         if center_data is None:
             raise RuntimeError("Failed to find a center pixel for the bad region.")
         x0, y0, dist_map = center_data
-        projected_center = self._nearest_allowed_point(allowed, x0, y0)
+        scribble_core = self._build_scribble_core(allowed, dist_map)
+        path_allowed = scribble_core if int(np.count_nonzero(scribble_core)) >= 2 else allowed
+        projected_center = self._nearest_allowed_point(path_allowed, x0, y0)
         if projected_center is None:
             raise RuntimeError("Failed to project the scribble center to the allowed region.")
         x0, y0 = projected_center
 
         pts = self._build_centerline_path(allowed, analysis_mask)
         if pts is None:
-            pts = self._best_segment(x0, y0, allowed, np.asarray(used_mask, dtype=bool), dist_map)
+            pts = self._best_segment(
+                x0,
+                y0,
+                path_allowed,
+                np.asarray(used_mask, dtype=bool),
+                _edt_inside(path_allowed),
+            )
         if pts is None:
-            ys, xs = np.where(allowed)
+            ys, xs = np.where(path_allowed)
             for _ in range(self.max_retries):
                 idx = int(self.rng.integers(0, xs.size))
                 x0 = int(xs[idx])
@@ -1632,9 +1835,9 @@ class LargestBadRegionGenerator:
                 pts = self._best_segment(
                     x0,
                     y0,
-                    allowed,
+                    path_allowed,
                     np.asarray(used_mask, dtype=bool),
-                    _edt_inside(allowed),
+                    _edt_inside(path_allowed),
                 )
                 if pts is not None:
                     break
@@ -1821,10 +2024,10 @@ def compute_superpixels(
             labels[~mask] = 0
         return _postprocess_superpixel_labels(
             labels,
-            nspix_hint=max(2, int(method.nspix)),
+            nspix_hint=max(2, int(n_segment_dynamic)),
             mask=mask if has_mask else None,
-            # For SSN we always want tiny / thread-like fragments to collapse
-            # to background after connectivity splitting.
+            # For SSN we always want tiny / thread-like fragments to merge
+            # into neighbouring superpixels after connectivity splitting.
             prune_small_thin=True,
         )
 

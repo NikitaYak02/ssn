@@ -30,19 +30,21 @@ def test_disconnected_regions_are_split_into_different_superpixels():
     assert out[1, 1] != out[5, 5]
 
 
-def test_small_or_thin_regions_become_background_for_ssn_cleanup():
+def test_small_or_thin_regions_merge_into_neighbors_for_ssn_cleanup():
     labels = np.zeros((24, 24), dtype=np.int32)
-    labels[3:20, 5] = 1          # thin line
-    labels[8:16, 12:20] = 2      # compact block
+    labels[3:20, 4:12] = 1       # left compact block
+    labels[3:20, 12] = 2         # thin separator touching both sides
+    labels[3:20, 13:20] = 3      # right compact block
 
     out = structs._postprocess_superpixel_labels(
         labels,
-        nspix_hint=2,
+        nspix_hint=3,
         prune_small_thin=True,
     )
 
-    assert np.all(out[3:20, 5] == 0)
-    assert np.any(out[8:16, 12:20] > 0)
+    line = out[3:20, 12]
+    assert np.all(line > 0)
+    assert np.all((line == out[3:20, 11]) | (line == out[3:20, 13]))
 
 
 def test_ssn_method_enables_embedding_defaults_automatically():

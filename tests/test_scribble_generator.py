@@ -259,6 +259,61 @@ def test_scribble_follows_inner_core_of_bad_region():
     assert float(line_dt.mean()) >= 5.0
 
 
+def test_scribble_stays_inside_dynamic_normalized_edt_core():
+    for y0, y1, x0, x1 in [(3, 21, 3, 21), (8, 20, 9, 15)]:
+        gt = np.zeros((28, 28), dtype=np.int32)
+        gt[y0:y1, x0:x1] = 1
+        pred = np.zeros_like(gt)
+
+        gen = interactive_eval.LargestBadRegionGenerator(
+            gt_mask=gt,
+            num_classes=2,
+            seed=0,
+            margin=0,
+            border_margin=0,
+            no_overlap=False,
+        )
+
+        gt_id, pts01 = gen.make_scribble(pred, np.zeros_like(gt, dtype=bool))
+
+        assert gt_id == 1
+
+        bad_region = (gt == 1) & (pred != 1)
+        analysis_mask = gen._analysis_region(bad_region, bad_region)
+        center_dt = _edt_inside(analysis_mask if analysis_mask.any() else bad_region)
+        corridor_union = np.zeros_like(bad_region, dtype=bool)
+        for corridor in gen._edt_corridor_masks(analysis_mask if analysis_mask.any() else bad_region, center_dt):
+            corridor_union |= corridor
+        xs, ys = _line_pixels(pts01, gt.shape)
+
+        assert np.all(corridor_union[ys, xs])
+
+
+def test_edt_centerline_avoids_boundary_without_explicit_border_margin():
+    gt = np.zeros((24, 24), dtype=np.int32)
+    gt[3:21, 3:21] = 1
+    pred = np.zeros_like(gt)
+
+    gen = interactive_eval.LargestBadRegionGenerator(
+        gt_mask=gt,
+        num_classes=2,
+        seed=0,
+        margin=0,
+        border_margin=0,
+        no_overlap=False,
+    )
+
+    gt_id, pts01 = gen.make_scribble(pred, np.zeros_like(gt, dtype=bool))
+
+    assert gt_id == 1
+
+    bad_region = (gt == 1) & (pred != 1)
+    bad_dt = _edt_inside(bad_region)
+    xs, ys = _line_pixels(pts01, gt.shape)
+
+    assert float(np.min(bad_dt[ys, xs])) > 1.0
+
+
 def test_scribble_respects_image_frame_as_outer_border():
     gt = np.zeros((18, 18), dtype=np.int32)
     gt[2:16, 0:12] = 1

@@ -536,7 +536,9 @@ class LargestBadRegionGenerator:
         smoothed = _smooth_region_mask(focus, radius=self.smoothing_radius)
         largest = self._largest_component(smoothed)
         if largest is not None and largest.any():
-            return largest
+            min_keep = max(2, int(0.65 * float(np.count_nonzero(focus))))
+            if int(np.count_nonzero(largest)) >= min_keep:
+                return largest
         return focus.copy()
 
     def _nearest_allowed_point(
@@ -643,6 +645,43 @@ class LargestBadRegionGenerator:
                 break
         return candidates
 
+    @staticmethod
+    def _normalized_dt_map(dist_map: np.ndarray) -> np.ndarray:
+        max_dt = float(np.max(dist_map))
+        if max_dt <= 1e-6:
+            return np.zeros_like(dist_map, dtype=np.float32)
+        return np.clip(dist_map.astype(np.float32) / float(max_dt), 0.0, 1.0)
+
+    def _edt_corridor_masks(
+        self,
+        allowed: np.ndarray,
+        dist_map: np.ndarray,
+    ) -> List[np.ndarray]:
+        allowed = np.asarray(allowed, dtype=bool)
+        if not allowed.any():
+            return []
+
+        allowed_vals = dist_map[allowed]
+        max_dt = float(np.max(allowed_vals)) if allowed_vals.size > 0 else 0.0
+        if max_dt <= 1e-6:
+            return [allowed.copy()]
+
+        norm_dt = self._normalized_dt_map(dist_map)
+        strict_interior = allowed & (dist_map > (1.0 + 1e-6))
+        corridor_base = strict_interior if strict_interior.any() else allowed
+        corridor = corridor_base & (norm_dt >= (0.40 - 1e-6))
+
+        masks: List[np.ndarray] = []
+        if corridor.any():
+            masks.append(corridor)
+        elif corridor_base.any():
+            masks.append(corridor_base)
+
+        plateau = allowed & (dist_map >= (max_dt - 1e-6))
+        if plateau.any():
+            masks.append(plateau)
+        return masks
+
     def _build_scribble_core(
         self,
         allowed: np.ndarray,
@@ -656,35 +695,26 @@ class LargestBadRegionGenerator:
         if not allowed.any():
             return allowed
 
-        max_dt = float(center_dt.max())
-        if max_dt <= 1.0:
-            return allowed
-
         min_pixels = max(6, int(0.03 * float(np.count_nonzero(allowed))))
-        base_margin = float(max(1, self.border_margin + 1))
-        thresholds = [
-            max(base_margin, 0.60 * max_dt),
-            max(base_margin, 0.50 * max_dt),
-            max(base_margin, 0.40 * max_dt),
-            max(1.0, min(base_margin, 0.30 * max_dt)),
-        ]
+        best_core: Optional[np.ndarray] = None
+        best_size = -1
 
-        seen: set[float] = set()
-        for thr in thresholds:
-            key = round(float(thr), 4)
-            if key in seen:
-                continue
-            seen.add(key)
-            core = allowed & (center_dt >= float(thr))
+        for core in self._edt_corridor_masks(allowed, center_dt):
             if not core.any():
                 continue
             core_largest = self._largest_component(core)
             if core_largest is None:
                 continue
-            if int(np.count_nonzero(core_largest)) >= min_pixels:
+            cur_size = int(np.count_nonzero(core_largest))
+            if cur_size > best_size:
+                best_size = cur_size
+                best_core = core_largest
+            if cur_size >= min_pixels:
                 return core_largest
 
-        return allowed
+        if best_core is not None and best_core.any():
+            return best_core
+        return allowed & (center_dt >= (float(center_dt.max()) - 1e-6))
 
     def _segment_pixels(
         self,
@@ -975,31 +1005,19 @@ class LargestBadRegionGenerator:
         cx, cy, center_dt = center_data
         focus_for_axis = focus_mask if focus_mask.any() else (analysis_mask if analysis_mask.any() else comp)
         max_dt = float(center_dt.max())
-        skeleton_candidates: List[np.ndarray] = []
-        seen_thresholds: set[float] = set()
-        for thr in [
-            max(1.0, 0.70 * max_dt),
-            max(1.0, 0.55 * max_dt),
-            max(1.0, 0.40 * max_dt),
-            1.0,
-        ]:
-            key = round(float(thr), 4)
-            if key in seen_thresholds:
-                continue
-            seen_thresholds.add(key)
-            ridge_mask = source_mask & (center_dt >= (float(thr) - 1e-6))
+        skeleton_candidates: List[Tuple[np.ndarray, np.ndarray]] = []
+        for ridge_mask in self._edt_corridor_masks(source_mask, center_dt):
             if not ridge_mask.any():
                 continue
-            skeleton_candidates.append(skeletonize(ridge_mask).astype(bool, copy=False))
-        skeleton_candidates.append(skeletonize(source_mask).astype(bool, copy=False))
-        skeleton_candidates.append(medial_axis(source_mask).astype(bool, copy=False))
+            skeleton_candidates.append((skeletonize(ridge_mask).astype(bool, copy=False), ridge_mask))
+            skeleton_candidates.append((medial_axis(ridge_mask).astype(bool, copy=False), ridge_mask))
 
         best_path: Optional[Tuple[np.ndarray, int]] = None
         best_score = -1.0
-        for skeleton in skeleton_candidates:
+        for skeleton, corridor_mask in skeleton_candidates:
             path_choice = self._centerline_path_from_skeleton(
                 skeleton=skeleton,
-                allowed=allowed,
+                allowed=corridor_mask,
                 center_xy=(cx, cy),
                 axis_mask=focus_for_axis,
                 dt_map=center_dt,
@@ -1141,6 +1159,7 @@ class LargestBadRegionGenerator:
         allowed_dt = _edt_inside(allowed)
         scribble_core = self._build_scribble_core(allowed, center_dt)
         focus_mask = scribble_core if scribble_core.any() else analysis_mask
+        path_allowed = scribble_core if int(np.count_nonzero(scribble_core)) >= 2 else allowed
         path_choice = self._build_centerline_path(
             allowed=allowed,
             analysis_mask=analysis_mask,
@@ -1148,7 +1167,8 @@ class LargestBadRegionGenerator:
             comp=comp,
         )
         if path_choice is None:
-            path_choice = self._straight_fallback_path(allowed, focus_mask, center_dt)
+            fallback_dt = _edt_inside(path_allowed)
+            path_choice = self._straight_fallback_path(path_allowed, focus_mask if focus_mask.any() else path_allowed, fallback_dt)
         if path_choice is None:
             return None
 
