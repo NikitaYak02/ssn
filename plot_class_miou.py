@@ -32,19 +32,21 @@ from PIL import Image
 
 
 DEFAULT_CLASS_INFO = [
-    ("BG", "#1c1818"),
-    ("Ccp", "#ff0000"),
-    ("Gl", "#cbff00"),
-    ("Mag", "#00ff66"),
-    ("Brt", "#0065ff"),
-    ("Po", "#cc00ff"),
-    ("Pn", "#dbff4c"),
-    ("Sph", "#4cff93"),
-    ("Apy", "#4c93ff"),
-    ("Hem", "#db4cff"),
-    ("Kvl", "#eaff99"),
-    ("Py/Mrc", "#ff4c4c"),
-    ("Tnt/Ttr", "#ff9999"),
+    ("bg", "#000000"),
+    ("ccp", "#ffa500"),
+    ("gl", "#9acd32"),
+    ("mag", "#ff4500"),
+    ("br", "#00bfff"),
+    ("po", "#a9a9a9"),
+    ("py", "#2f4f4f"),
+    ("pn", "#ffff00"),
+    ("sh", "#ee82ee"),
+    ("apy", "#556b2f"),
+    ("gmt", "#a0522d"),
+    ("tnt", "#483d8b"),
+    ("cv", "#008000"),
+    ("mrc", "#00008b"),
+    ("au", "#8b008b"),
 ]
 
 

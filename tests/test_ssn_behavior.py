@@ -12,6 +12,7 @@ sys.path.insert(0, str(ROOT))
 
 import structs  # noqa: E402
 import evaluate_interactive_annotation as interactive_eval  # noqa: E402
+import model as ssn_model  # noqa: E402
 
 
 def test_disconnected_regions_are_split_into_different_superpixels():
@@ -82,7 +83,75 @@ def test_embedding_threshold_default_is_consistent():
     args = parser.parse_args(["--out", "tmp_out"])
 
     assert algo._embedding_threshold == 0.99
-    assert args.emb_threshold == 0.99
+    assert args.emb_threshold == 0.988
+    assert args.sensitivity == 1.8
+
+
+def test_embedding_profiles_preserve_user_threshold_floor():
+    image = Image.fromarray(np.zeros((16, 16, 3), dtype=np.uint8), mode="RGB")
+    algo = structs.SuperPixelAnnotationAlgo(
+        downscale_coeff=1.0,
+        superpixel_methods=[],
+        image=image,
+    )
+    method = structs.SSNSuperpixel(
+        weight_path="relative/path/to/model.pth",
+        nspix=25,
+        fdim=20,
+        niter=5,
+        color_scale=0.26,
+        pos_scale=2.5,
+    )
+    algo.superpixel_methods = [method]
+    algo._embedding_threshold = 1.0
+
+    gt_mask = np.zeros((8, 8), dtype=np.int32)
+    pred_mask = np.zeros((8, 8), dtype=np.int32)
+    profiles = interactive_eval._build_propagation_profiles(
+        algo=algo,
+        gt_mask=gt_mask,
+        pred_mask=pred_mask,
+        gt_id=0,
+        class_scribble_counts=[1],
+        sensitivity=1.5,
+    )
+
+    assert profiles
+    assert all(p["embedding_threshold_override"] == 1.0 for p in profiles)
+
+
+def test_embedding_profiles_never_reduce_threshold_below_user_value():
+    image = Image.fromarray(np.zeros((16, 16, 3), dtype=np.uint8), mode="RGB")
+    algo = structs.SuperPixelAnnotationAlgo(
+        downscale_coeff=1.0,
+        superpixel_methods=[],
+        image=image,
+    )
+    method = structs.SSNSuperpixel(
+        weight_path="relative/path/to/model.pth",
+        nspix=25,
+        fdim=20,
+        niter=5,
+        color_scale=0.26,
+        pos_scale=2.5,
+    )
+    algo.superpixel_methods = [method]
+    algo._embedding_threshold = 0.985
+
+    gt_mask = np.zeros((8, 8), dtype=np.int32)
+    pred_mask = np.zeros((8, 8), dtype=np.int32)
+    pred_mask[:, :] = 0
+    profiles = interactive_eval._build_propagation_profiles(
+        algo=algo,
+        gt_mask=gt_mask,
+        pred_mask=pred_mask,
+        gt_id=0,
+        class_scribble_counts=[5],
+        sensitivity=2.0,
+    )
+
+    assert len(profiles) >= 1
+    assert all(p["embedding_threshold_override"] >= 0.985 for p in profiles)
 
 
 def test_bbox_containment_uses_union_and_includes_boundaries():
@@ -548,3 +617,277 @@ def test_serialize_roundtrip_preserves_split_superpixels_and_bbox(tmp_path):
     assert loaded_sp.parents == [3, 7]
     assert loaded_anno.parent_superpixel == 10
     assert loaded_anno.parent_scribble == [5]
+
+
+def test_run_ssn_inference_uses_dense_path_on_accelerator_and_warm_start(monkeypatch):
+    class _FakeTensor:
+        def __init__(self, device_type, height=32, width=32):
+            self.device = type("Device", (), {"type": device_type})()
+            self.shape = (1, 20, height, width)
+
+    calls = []
+
+    def fake_dense(pixel_f, nspix, n_iter, init_spixel_features=None, init_label_map=None):
+        calls.append(("dense", pixel_f.device.type, init_spixel_features is not None))
+        return "dense"
+
+    def fake_sparse(pixel_f, nspix, n_iter):
+        calls.append(("sparse", pixel_f.device.type, False))
+        return "sparse"
+
+    monkeypatch.setattr(ssn_model, "dense_ssn_iter_inference", fake_dense)
+    monkeypatch.setattr(ssn_model, "sparse_ssn_iter", fake_sparse)
+
+    assert ssn_model.run_ssn_inference(_FakeTensor("mps", 64, 64), 16, 5) == "dense"
+    assert ssn_model.run_ssn_inference(_FakeTensor("cpu"), 16, 5) == "sparse"
+    assert (
+        ssn_model.run_ssn_inference(
+            _FakeTensor("cpu"),
+            16,
+            5,
+            init_spixel_features=np.zeros((4, 4), dtype=np.float32),
+        )
+        == "dense"
+    )
+    assert calls == [
+        ("dense", "mps", False),
+        ("sparse", "cpu", False),
+        ("dense", "cpu", True),
+    ]
+
+
+def test_run_ssn_inference_falls_back_to_sparse_for_large_mps_frames(monkeypatch):
+    class _FakeTensor:
+        def __init__(self):
+            self.device = type("Device", (), {"type": "mps"})()
+            self.shape = (1, 20, 1024, 1024)
+            self.float_called = False
+            self.cpu_called = False
+
+        def float(self):
+            self.float_called = True
+            return self
+
+        def cpu(self):
+            self.cpu_called = True
+            return self
+
+    fake = _FakeTensor()
+    calls = []
+
+    def fake_sparse(pixel_f, nspix, n_iter):
+        calls.append(pixel_f)
+        return "sparse"
+
+    monkeypatch.setattr(ssn_model, "sparse_ssn_iter", fake_sparse)
+    monkeypatch.setattr(
+        ssn_model,
+        "dense_ssn_iter_inference",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("dense path should not be used")),
+    )
+
+    assert ssn_model.run_ssn_inference(fake, 16, 5) == "sparse"
+    assert fake.float_called is True
+    assert fake.cpu_called is True
+    assert calls == [fake]
+
+
+def test_full_image_embedding_cache_reuses_cached_ssn_feature_map(monkeypatch):
+    image = Image.fromarray(np.zeros((16, 16, 3), dtype=np.uint8), mode="RGB")
+    algo = structs.SuperPixelAnnotationAlgo(
+        downscale_coeff=1.0,
+        superpixel_methods=[],
+        image=image,
+    )
+    algo.embedding_weight_path = os.path.abspath("relative/path/to/model.pth")
+    algo.embedding_fdim = 4
+
+    calls = []
+
+    def fake_feature_map(*args, **kwargs):
+        calls.append(kwargs["nspix_context"])
+        return np.ones((16, 16, 4), dtype=np.float32)
+
+    monkeypatch.setattr(structs, "_compute_ssn_feature_map", fake_feature_map)
+
+    emb1 = algo._get_full_image_pixel_embeddings()
+    emb2 = algo._get_full_image_pixel_embeddings()
+
+    assert emb1 is not None
+    assert emb2 is not None
+    assert emb1.shape == (16, 16, 4)
+    assert len(calls) == 1
+    assert calls == [100]
+
+
+def test_ssn_roi_creation_reuses_full_image_embeddings(monkeypatch):
+    image = Image.fromarray(np.zeros((32, 32, 3), dtype=np.uint8), mode="RGB")
+    algo = structs.SuperPixelAnnotationAlgo(
+        downscale_coeff=1.0,
+        superpixel_methods=[],
+        image=image,
+    )
+    method = structs.SSNSuperpixel(
+        weight_path="relative/path/to/model.pth",
+        nspix=25,
+        fdim=20,
+        niter=5,
+        color_scale=0.26,
+        pos_scale=2.5,
+    )
+    algo.superpixel_methods = [method]
+    algo.superpixels[method] = []
+    algo._annotations[method] = structs.ImageAnnotation(annotations=[])
+    algo._superpixel_ind[method] = 0
+    algo._annotation_ind[method] = 0
+    algo.embedding_weight_path = os.path.abspath(method.weight_path)
+    algo.embedding_fdim = method.fdim
+    algo.embedding_color_scale = method.color_scale
+    algo.embedding_pos_scale = method.pos_scale
+
+    monkeypatch.setattr(
+        algo,
+        "_get_full_image_pixel_embeddings",
+        lambda: np.ones((32, 32, 20), dtype=np.float32),
+    )
+    monkeypatch.setattr(
+        algo,
+        "_compute_ssn_superpixels_for_roi",
+        lambda *args, **kwargs: np.ones((8, 8), dtype=np.int32),
+    )
+    monkeypatch.setattr(
+        structs,
+        "_compute_roi_embeddings",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("ROI embeddings should be cropped from the full-image cache")
+        ),
+    )
+
+    scrib = structs.Scribble(
+        id=0,
+        points=np.array([[0.05, 0.05], [0.20, 0.05]], dtype=np.float32),
+        params=structs.ScribbleParams(radius=1, code=1),
+    )
+    bbox = [0.0, 0.0, 0.25, 0.25]
+    image_roi = algo.image_lab[:8, :8]
+    mask = np.ones((8, 8), dtype=bool)
+
+    created = algo._create_superpixel_for_mask(method, image_roi, mask, bbox, scrib)
+
+    assert created == 1
+    assert len(algo.superpixels[method]) == 1
+    assert algo.superpixels[method][0].emb is not None
+
+
+def test_ssn_roi_assignment_warm_start_reuses_previous_centroids(monkeypatch):
+    image = Image.fromarray(np.zeros((32, 32, 3), dtype=np.uint8), mode="RGB")
+    algo = structs.SuperPixelAnnotationAlgo(
+        downscale_coeff=1.0,
+        superpixel_methods=[],
+        image=image,
+    )
+    method = structs.SSNSuperpixel(
+        weight_path="relative/path/to/model.pth",
+        nspix=25,
+        fdim=20,
+        niter=5,
+        color_scale=0.26,
+        pos_scale=2.5,
+    )
+    roi_px = (0, 0, 8, 8)
+    image_roi = algo.image_lab[:8, :8]
+    mask1 = np.ones((8, 8), dtype=bool)
+    mask2 = np.ones((8, 8), dtype=bool)
+    mask2[0, 0] = False
+    calls = []
+
+    monkeypatch.setattr(
+        algo,
+        "_get_cached_ssn_feature_map",
+        lambda *args, **kwargs: np.zeros((8, 8, 20), dtype=np.float32),
+    )
+
+    def fake_inference(feature_map, *, nspix, niter, init_spixel_features=None, init_label_map=None):
+        calls.append(init_spixel_features is not None)
+        return np.zeros((8, 8), dtype=np.int32), np.ones((20, max(2, nspix)), dtype=np.float32)
+
+    monkeypatch.setattr(structs, "_run_ssn_feature_inference", fake_inference)
+
+    algo._compute_ssn_superpixels_for_roi(method, image_roi, mask1, roi_px)
+    algo._compute_ssn_superpixels_for_roi(method, image_roi, mask2, roi_px)
+
+    assert calls == [False, True]
+
+
+def test_ssn_roi_label_cache_skips_repeated_inference_for_same_mask(monkeypatch):
+    image = Image.fromarray(np.zeros((32, 32, 3), dtype=np.uint8), mode="RGB")
+    algo = structs.SuperPixelAnnotationAlgo(
+        downscale_coeff=1.0,
+        superpixel_methods=[],
+        image=image,
+    )
+    method = structs.SSNSuperpixel(
+        weight_path="relative/path/to/model.pth",
+        nspix=25,
+        fdim=20,
+        niter=5,
+        color_scale=0.26,
+        pos_scale=2.5,
+    )
+    roi_px = (0, 0, 8, 8)
+    image_roi = algo.image_lab[:8, :8]
+    mask = np.ones((8, 8), dtype=bool)
+    calls = []
+
+    monkeypatch.setattr(
+        algo,
+        "_get_cached_ssn_feature_map",
+        lambda *args, **kwargs: np.zeros((8, 8, 20), dtype=np.float32),
+    )
+
+    def fake_inference(feature_map, *, nspix, niter, init_spixel_features=None, init_label_map=None):
+        calls.append(1)
+        return np.zeros((8, 8), dtype=np.int32), np.ones((20, max(2, nspix)), dtype=np.float32)
+
+    monkeypatch.setattr(structs, "_run_ssn_feature_inference", fake_inference)
+
+    labels1 = algo._compute_ssn_superpixels_for_roi(method, image_roi, mask, roi_px)
+    labels2 = algo._compute_ssn_superpixels_for_roi(method, image_roi, mask, roi_px)
+
+    assert len(calls) == 1
+    assert np.array_equal(labels1, labels2)
+
+
+def test_precompute_ssn_roi_feature_cache_batches_same_shape_rois(monkeypatch):
+    image = Image.fromarray(np.zeros((32, 32, 3), dtype=np.uint8), mode="RGB")
+    algo = structs.SuperPixelAnnotationAlgo(
+        downscale_coeff=1.0,
+        superpixel_methods=[],
+        image=image,
+    )
+    method = structs.SSNSuperpixel(
+        weight_path="relative/path/to/model.pth",
+        nspix=25,
+        fdim=20,
+        niter=5,
+        color_scale=0.26,
+        pos_scale=2.5,
+    )
+    calls = []
+
+    def fake_batch(image_lab_batch, weight_path, *, fdim, color_scale, pos_scale, nspix_context, use_fp16):
+        calls.append((len(image_lab_batch), nspix_context, tuple(image_lab_batch[0].shape[:2])))
+        return [
+            np.zeros((roi.shape[0], roi.shape[1], fdim), dtype=np.float32)
+            for roi in image_lab_batch
+        ]
+
+    monkeypatch.setattr(structs, "_compute_ssn_feature_maps_batch", fake_batch)
+
+    computed = algo.precompute_ssn_roi_feature_cache(
+        method,
+        [(0, 0, 8, 8), (8, 0, 16, 8)],
+    )
+
+    assert computed == 2
+    assert calls == [(2, structs._dynamic_nspix_from_shape(8, 8), (8, 8))]

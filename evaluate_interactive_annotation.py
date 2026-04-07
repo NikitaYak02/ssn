@@ -40,13 +40,18 @@ evaluate_interactive_annotation.py
 
 Флаги пропагации:
     --sensitivity 0.0      — отключить распространение штрихов (только прямые аннотации)
-    --sensitivity 1.0..5.0 — включить BFS-распространение по соседним суперпикселям
+    --sensitivity 1.8      — рекомендуемый консервативный режим для SSN+embeddings
     --emb_weights path.pth — использовать cosine-similarity по эмбедингам вместо LAB-цвета
-    --emb_threshold 0.75   — порог косинусного сходства (default 0.99)
+    --emb_threshold 0.988  — строгий порог косинусного сходства для аккуратного propagation
+
+Выбор региона для нового штриха:
+    --region_selection_cycle miou_gain,largest_error,unannotated
+                          — чередовать стратегии по шагам внутри одной разметки
 """
 
 import argparse
 import csv
+import gzip
 import json
 import logging
 import math
@@ -54,7 +59,7 @@ import sys
 from collections import deque
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 from PIL import Image, ImageDraw
@@ -77,22 +82,24 @@ import structs  # noqa: E402 (must come after sys.path hack)
 
 
 # ─────────────────────────────────────────────────────────────────────────────────
-#  Константы / цвета (13-классовая задача минералов; заменить при необходимости)
+#  Константы / цвета
 # ─────────────────────────────────────────────────────────────────────────────────
 DEFAULT_CLASS_INFO = [
-    ("BG",        "#1c1818"),
-    ("Ccp",       "#ff0000"),
-    ("Gl",        "#cbff00"),
-    ("Mag",       "#00ff66"),
-    ("Brt",       "#0065ff"),
-    ("Po",        "#cc00ff"),
-    ("Pn",        "#dbff4c"),
-    ("Sph",       "#4cff93"),
-    ("Apy",       "#4c93ff"),
-    ("Hem",       "#db4cff"),
-    ("Kvl",       "#eaff99"),
-    ("Py/Mrc",    "#ff4c4c"),
-    ("Tnt/Ttr",   "#ff9999"),
+    ("bg",        "#000000"),
+    ("ccp",       "#ffa500"),
+    ("gl",        "#9acd32"),
+    ("mag",       "#ff4500"),
+    ("br",        "#00bfff"),
+    ("po",        "#a9a9a9"),
+    ("py",        "#2f4f4f"),
+    ("pn",        "#ffff00"),
+    ("sh",        "#ee82ee"),
+    ("apy",       "#556b2f"),
+    ("gmt",       "#a0522d"),
+    ("tnt",       "#483d8b"),
+    ("cv",        "#008000"),
+    ("mrc",       "#00008b"),
+    ("au",        "#8b008b"),
 ]
 
 
@@ -186,6 +193,30 @@ def discover_image_pairs(img_dir: str, mask_dir: str) -> List[Tuple[Path, Path]]
         if mask_path.exists():
             pairs.append((img_path, mask_path))
     return pairs
+
+
+def load_spanno_image_size(spanno_path: str) -> Optional[Tuple[int, int]]:
+    """
+    Read image size from .spanno metadata when available.
+
+    Returns `(width, height)` or `None` if the file has no compatible metadata.
+    """
+    open_fn = gzip.open if str(spanno_path).endswith(".gz") else open
+    try:
+        with open_fn(spanno_path, mode="rt", encoding="utf-8") as f:
+            root = json.load(f)
+    except Exception:
+        return None
+
+    meta = root.get("_meta") if isinstance(root, dict) else None
+    image_meta = meta.get("image") if isinstance(meta, dict) else None
+    size_wh = image_meta.get("size_wh") if isinstance(image_meta, dict) else None
+    if not isinstance(size_wh, list) or len(size_wh) != 2:
+        return None
+    try:
+        return int(size_wh[0]), int(size_wh[1])
+    except Exception:
+        return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────────
@@ -353,9 +384,16 @@ class LargestBadRegionGenerator:
     регионам, но и классам с низким текущим IoU.
     """
 
+    VALID_REGION_SELECTION_MODES = (
+        "miou_gain",
+        "largest_error",
+        "unannotated",
+    )
+
     def __init__(self, gt_mask: np.ndarray, num_classes: int,
                  seed: int = 0, margin: int = 2, border_margin: int = 3,
-                 no_overlap: bool = True, max_retries: int = 200):
+                 no_overlap: bool = True, max_retries: int = 200,
+                 region_selection_cycle: Optional[Sequence[str]] = None):
         self.gt = gt_mask.astype(np.int32)
         self.H, self.W = gt_mask.shape
         self.num_classes = num_classes
@@ -372,6 +410,22 @@ class LargestBadRegionGenerator:
         self._class_failures: Dict[int, int] = {}
         self._last_selected_signature: Optional[Tuple[int, int, int, int, int, int]] = None
         self._last_selected_class: Optional[int] = None
+        cycle = list(region_selection_cycle or ["miou_gain"])
+        normalized_cycle: List[str] = []
+        for mode in cycle:
+            mode_norm = str(mode).strip().lower()
+            if not mode_norm:
+                continue
+            if mode_norm not in self.VALID_REGION_SELECTION_MODES:
+                raise ValueError(
+                    f"Unknown region selection mode: {mode!r}. "
+                    f"Expected one of {self.VALID_REGION_SELECTION_MODES}."
+                )
+            normalized_cycle.append(mode_norm)
+        if not normalized_cycle:
+            normalized_cycle = ["miou_gain"]
+        self.region_selection_cycle: Tuple[str, ...] = tuple(normalized_cycle)
+        self._selection_step: int = 0
         self._class_area = np.array(
             [int(np.count_nonzero(self.gt == cid)) for cid in range(num_classes)],
             dtype=np.int64,
@@ -408,6 +462,32 @@ class LargestBadRegionGenerator:
             else:
                 inner = cls.copy()
             self._gt_inner.append(inner)
+
+    def set_selection_step(self, step: int) -> None:
+        self._selection_step = max(0, int(step))
+
+    def _current_region_selection_mode(self) -> str:
+        return self.region_selection_cycle[
+            self._selection_step % len(self.region_selection_cycle)
+        ]
+
+    def _advance_region_selection_cycle(self) -> None:
+        self._selection_step += 1
+
+    def _region_error_mask(
+        self,
+        cid: int,
+        pred_mask: np.ndarray,
+        mode: str,
+    ) -> np.ndarray:
+        gt_c = (self.gt == cid)
+        if mode == "miou_gain":
+            return gt_c & (pred_mask != cid)
+        if mode == "largest_error":
+            return gt_c & (pred_mask >= 0) & (pred_mask != cid)
+        if mode == "unannotated":
+            return gt_c & (pred_mask < 0)
+        raise ValueError(f"Unsupported region selection mode: {mode!r}")
 
     # -- helpers ---
     def _largest_component(self, bad: np.ndarray) -> Optional[np.ndarray]:
@@ -1195,12 +1275,13 @@ class LargestBadRegionGenerator:
         pred_mask: np.ndarray,
         used_mask: np.ndarray,
         class_scribble_counts: Optional[List[int]] = None,
+        selection_mode: str = "miou_gain",
     ) -> Tuple[Optional[int], Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
         inter, union = self._class_inter_union(pred_mask)
         raw_candidates = []
 
         for cid in range(self.num_classes):
-            bad_c = (self.gt == cid) & (pred_mask != cid)
+            bad_c = self._region_error_mask(cid, pred_mask, selection_mode)
             if not bad_c.any():
                 continue
 
@@ -1222,12 +1303,23 @@ class LargestBadRegionGenerator:
                     continue
 
                 comp_area = int(comp.sum())
-                comp_share = math.sqrt(float(comp_area) / float(max(1, union_c)))
                 comp_fail = float(self._component_failures.get(signature, 0))
                 recent_pen = 1.0 if signature in self._recent_signatures else 0.0
+                comp_share = math.sqrt(float(comp_area) / float(max(1, union_c)))
+                if selection_mode == "miou_gain":
+                    primary = class_priority + 0.65 * comp_share
+                    secondary = float(comp_area)
+                elif selection_mode == "largest_error":
+                    primary = float(comp_area)
+                    secondary = class_priority
+                elif selection_mode == "unannotated":
+                    primary = float(comp_area)
+                    secondary = class_priority + 0.25 * comp_share
+                else:
+                    raise ValueError(f"Unsupported region selection mode: {selection_mode!r}")
                 raw_score = (
-                    class_priority + 0.65 * comp_share - comp_fail - 0.05 * recent_pen,
-                    float(comp_area),
+                    float(primary) - comp_fail - 0.05 * recent_pen,
+                    float(secondary),
                     float(self.rng.random()),
                 )
                 raw_candidates.append((raw_score, int(cid), comp, allowed, signature, union_c))
@@ -1350,11 +1442,20 @@ class LargestBadRegionGenerator:
         if not bad.any():
             raise StopIteration("All pixels correctly labelled.")
 
+        selection_mode = self._current_region_selection_mode()
         cid, comp, allowed, pts01 = self._select_class_component(
             pred_mask,
             used_mask,
             class_scribble_counts=class_scribble_counts,
+            selection_mode=selection_mode,
         )
+        if cid is None and selection_mode != "miou_gain":
+            cid, comp, allowed, pts01 = self._select_class_component(
+                pred_mask,
+                used_mask,
+                class_scribble_counts=class_scribble_counts,
+                selection_mode="miou_gain",
+            )
         if cid is None or comp is None or allowed is None:
             comp = self._largest_component(bad)
             if comp is None:
@@ -1378,6 +1479,7 @@ class LargestBadRegionGenerator:
                 _, pts01 = fallback_choice
 
         if pts01 is not None:
+            self._advance_region_selection_cycle()
             return cid, pts01
 
         raise RuntimeError("Failed to generate scribble after max_retries.")
@@ -1445,11 +1547,16 @@ def _build_propagation_profiles(
     if sensitivity <= 0.0:
         return []
 
+    def _clamp_similarity_threshold(value: float) -> float:
+        return float(min(1.0, max(0.0, value)))
+
     class_iou = _class_iou(pred_mask, gt_mask, gt_id)
     n_class_scribbles = int(class_scribble_counts[gt_id]) if class_scribble_counts else 0
     present_classes = [int(c) for c in np.unique(gt_mask)]
     late_stage = int(sum(int(v) for v in class_scribble_counts)) >= max(6, len(present_classes))
-    base_threshold = float(getattr(algo, "_embedding_threshold", 0.99))
+    base_threshold = _clamp_similarity_threshold(
+        float(getattr(algo, "_embedding_threshold", 0.99))
+    )
     active_method = algo.superpixel_methods[0] if algo.superpixel_methods else None
     use_embeddings = bool(getattr(algo, "embedding_weight_path", None)) or isinstance(
         active_method,
@@ -1459,26 +1566,26 @@ def _build_propagation_profiles(
     if use_embeddings:
         profiles: List[Dict[str, float]] = [
             {
-                "sens": float(max(1e-6, sensitivity * 0.70)),
-                "radius_scale": 0.80,
+                "sens": float(max(1e-6, sensitivity * 0.55)),
+                "radius_scale": 0.65,
                 "property_scale": 0.85,
-                "embedding_threshold_override": min(0.999, base_threshold + 0.015),
+                "embedding_threshold_override": _clamp_similarity_threshold(
+                    max(base_threshold, base_threshold + 0.01)
+                ),
             }
         ]
         should_aggressive = (
-            late_stage
-            or n_class_scribbles >= 4
-            or (n_class_scribbles >= 2 and class_iou >= 0.40)
+            (late_stage and (n_class_scribbles >= 3 or class_iou >= 0.45))
+            or (n_class_scribbles >= 4 and class_iou >= 0.60)
         )
         if should_aggressive:
             profiles.append(
                 {
-                    "sens": float(max(1e-6, sensitivity * (1.0 if late_stage else 0.90))),
-                    "radius_scale": 1.15 if late_stage else 0.95,
-                    "property_scale": 1.00,
-                    "embedding_threshold_override": max(
-                        0.93,
-                        base_threshold - (0.02 if late_stage else 0.01),
+                    "sens": float(max(1e-6, sensitivity * (0.75 if late_stage else 0.65))),
+                    "radius_scale": 0.90 if late_stage else 0.75,
+                    "property_scale": 0.95,
+                    "embedding_threshold_override": _clamp_similarity_threshold(
+                        base_threshold
                     ),
                 }
             )
@@ -1486,24 +1593,23 @@ def _build_propagation_profiles(
 
     profiles = [
         {
-            "sens": float(max(1e-6, sensitivity * 0.55)),
-            "radius_scale": 0.60,
+            "sens": float(max(1e-6, sensitivity * 0.45)),
+            "radius_scale": 0.55,
             "property_scale": 0.55,
-            "embedding_threshold_override": min(0.999, base_threshold + 0.01),
+            "embedding_threshold_override": _clamp_similarity_threshold(base_threshold),
         }
     ]
     should_aggressive = (
-        late_stage
-        or n_class_scribbles >= 4
-        or (n_class_scribbles >= 2 and class_iou >= 0.40)
+        (late_stage and (n_class_scribbles >= 3 or class_iou >= 0.45))
+        or (n_class_scribbles >= 4 and class_iou >= 0.60)
     )
     if should_aggressive:
         profiles.append(
             {
-                "sens": float(max(1e-6, sensitivity * (0.90 if late_stage else 0.80))),
-                "radius_scale": 1.05 if late_stage else 0.90,
-                "property_scale": 0.90,
-                "embedding_threshold_override": min(0.999, base_threshold),
+                "sens": float(max(1e-6, sensitivity * (0.70 if late_stage else 0.60))),
+                "radius_scale": 0.85 if late_stage else 0.75,
+                "property_scale": 0.80,
+                "embedding_threshold_override": _clamp_similarity_threshold(base_threshold),
             }
         )
     return profiles
@@ -1604,6 +1710,25 @@ def build_sp_method(args) -> "structs.SuperPixelMethod":
             pos_scale=float(args.ssn_pos_scale),
         )
     raise ValueError(f"Unknown method: {args.method!r}")
+
+
+def parse_region_selection_cycle(raw_value: str) -> List[str]:
+    items = [part.strip().lower() for part in str(raw_value).split(",")]
+    items = [part for part in items if part]
+    if not items:
+        raise ValueError("Region selection cycle must not be empty.")
+    invalid = [
+        part for part in items
+        if part not in LargestBadRegionGenerator.VALID_REGION_SELECTION_MODES
+    ]
+    if invalid:
+        raise ValueError(
+            "Unknown region selection mode(s): "
+            + ", ".join(repr(x) for x in invalid)
+            + ". Expected one of "
+            + ", ".join(LargestBadRegionGenerator.VALID_REGION_SELECTION_MODES)
+        )
+    return items
 
 
 # ─────────────────────────────────────────────────────────────────────────────────
@@ -1791,6 +1916,14 @@ def run_single_image(
     use_precomputed = False
     resumed_from_state = False
     if spanno_path and Path(spanno_path).exists():
+        spanno_size = load_spanno_image_size(spanno_path)
+        if spanno_size is not None and tuple(spanno_size) != tuple(img.size):
+            raise ValueError(
+                "The provided --spanno was created for a different image size: "
+                f"spanno={spanno_size[0]}x{spanno_size[1]}, "
+                f"current={img.size[0]}x{img.size[1]}. "
+                "For a cropped image, recompute superpixels for that crop and pass the new .spanno file."
+            )
         algo.deserialize(spanno_path)
         resumed_from_state = len(getattr(algo, "_scribbles", [])) > 0
         use_precomputed = not resumed_from_state
@@ -1837,6 +1970,7 @@ def run_single_image(
         border_margin=int(args.border_margin),
         no_overlap=bool(args.no_overlap),
         max_retries=200,
+        region_selection_cycle=parse_region_selection_cycle(args.region_selection_cycle),
     )
 
     # Накопители стоимости взаимодействия
@@ -1850,6 +1984,7 @@ def run_single_image(
     if resumed_from_state and getattr(algo, "_scribbles", None):
         existing_scribbles = list(algo._scribbles)
         start_step = len(existing_scribbles)
+        generator.set_selection_step(start_step)
         existing_ids = [int(getattr(s, "id", 0)) for s in existing_scribbles]
         next_scribble_id = (max(existing_ids) + 1) if existing_ids else 1
 
@@ -2168,6 +2303,14 @@ def build_parser() -> argparse.ArgumentParser:
                          help="Запрет перекрытия новых штрихов с ранее нанесёнными")
     grp_sim.add_argument("--max_no_progress", type=int, default=12,
                          help="Ранний стоп после N штрихов подряд без прогресса")
+    grp_sim.add_argument(
+        "--region_selection_cycle",
+        default="miou_gain,largest_error,unannotated",
+        help=(
+            "Comma-separated cycle of region selection modes for new scribbles. "
+            "Supported: miou_gain, largest_error, unannotated."
+        ),
+    )
 
     # --- Метод суперпикселей ---
     grp_sp = ap.add_argument_group("Superpixel method")
@@ -2194,13 +2337,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     # --- Распространение ---
     grp_prop = ap.add_argument_group("Propagation")
-    grp_prop.add_argument("--sensitivity", type=float, default=0.0,
-                          help="Чувствительность BFS-распространения (0 = выкл.)")
+    grp_prop.add_argument("--sensitivity", type=float, default=1.8,
+                          help="Чувствительность BFS-распространения (0 = выкл., default 1.8)")
     grp_prop.add_argument("--emb_weights", default=None,
                           help="Чекпоинт для эмбединг-пропагации (.pth). "
                                "Если задан, использует cosine-similarity вместо LAB")
-    grp_prop.add_argument("--emb_threshold", type=float, default=0.99,
-                          help="Порог косинусного сходства (default 0.99)")
+    grp_prop.add_argument("--emb_threshold", type=float, default=0.988,
+                          help="Порог косинусного сходства (default 0.988)")
 
     # --- Визуализация ---
     grp_viz = ap.add_argument_group("Visualization")

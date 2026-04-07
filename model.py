@@ -1,7 +1,43 @@
 import torch
 import torch.nn as nn
 
-from lib.ssn.ssn import ssn_iter, sparse_ssn_iter
+from lib.ssn.ssn import dense_ssn_iter_inference, ssn_iter, sparse_ssn_iter
+
+_MPS_DENSE_PIXEL_LIMIT = 512 * 512
+
+
+def run_ssn_inference(pixel_f, nspix, n_iter,
+                      init_spixel_features=None, init_label_map=None):
+    """
+    Run the inference-time SSN assignment on the most appropriate backend.
+
+    Accelerators use the dense device-local path to avoid copying feature maps
+    back to CPU. Warm-started refinement also uses the dense path on CPU
+    because the sparse inference implementation does not accept an initial
+    centroid state.
+    """
+    needs_warm_start = (
+        init_spixel_features is not None or init_label_map is not None
+    )
+    pixel_count = int(pixel_f.shape[-1]) * int(pixel_f.shape[-2])
+    use_dense = pixel_f.device.type == "cuda"
+    if pixel_f.device.type == "mps":
+        use_dense = pixel_count <= _MPS_DENSE_PIXEL_LIMIT
+
+    if needs_warm_start:
+        use_dense = True
+
+    if use_dense:
+        return dense_ssn_iter_inference(
+            pixel_f,
+            nspix,
+            n_iter,
+            init_spixel_features=init_spixel_features,
+            init_label_map=init_label_map,
+        )
+    if pixel_f.device.type == "mps":
+        return sparse_ssn_iter(pixel_f.float().cpu(), nspix, n_iter)
+    return sparse_ssn_iter(pixel_f, nspix, n_iter)
 
 
 def conv_bn_relu(in_c, out_c):
@@ -50,13 +86,16 @@ class SSNModel(nn.Module):
         if self.training:
             return ssn_iter(pixel_f, self.nspix, self.n_iter)
 
-        # PyTorch MPS does not implement sparse COO construction yet.
-        # Keep feature extraction on Metal, then run the sparse SLIC-style
-        # assignment on CPU for eval/inference paths.
-        if pixel_f.device.type == "mps":
-            return sparse_ssn_iter(pixel_f.cpu(), self.nspix, self.n_iter)
+        return self.assign_features(pixel_f)
 
-        return sparse_ssn_iter(pixel_f, self.nspix, self.n_iter)
+    def assign_features(self, pixel_f, init_spixel_features=None, init_label_map=None):
+        return run_ssn_inference(
+            pixel_f,
+            self.nspix,
+            self.n_iter,
+            init_spixel_features=init_spixel_features,
+            init_label_map=init_label_map,
+        )
 
     def feature_extract(self, x):
         s1 = self.scale1(x)

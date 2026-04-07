@@ -355,9 +355,30 @@ def parse_class_codes(raw: str | None) -> list[int] | None:
 
 
 def default_colors(n: int) -> list[tuple[int, int, int]]:
-    colors: list[tuple[int, int, int]] = []
-    for idx in range(max(1, n)):
-        hue = ((idx * 0.6180339887498949) % 1.0) * 179.0
+    palette = [
+        (0, 0, 0),
+        (255, 165, 0),
+        (154, 205, 50),
+        (255, 69, 0),
+        (0, 191, 255),
+        (169, 169, 169),
+        (47, 79, 79),
+        (255, 255, 0),
+        (238, 130, 238),
+        (85, 107, 47),
+        (160, 82, 45),
+        (72, 61, 139),
+        (0, 128, 0),
+        (0, 0, 139),
+        (139, 0, 139),
+    ]
+    if n <= len(palette):
+        return palette[:max(1, n)]
+
+    colors: list[tuple[int, int, int]] = list(palette)
+    for idx in range(len(palette), max(1, n)):
+        extra_idx = idx - len(palette)
+        hue = ((extra_idx * 0.6180339887498949) % 1.0) * 179.0
         hsv = np.uint8([[[int(hue), 200, 255]]])
         rgb = cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB)[0, 0]
         colors.append((int(rgb[0]), int(rgb[1]), int(rgb[2])))

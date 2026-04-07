@@ -10,6 +10,7 @@ import gzip
 import tempfile
 import hashlib
 from collections import deque
+import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -28,7 +29,7 @@ from shapely.ops import split as shp_split
 from shapely.ops import unary_union  # union геометрий
 
 from shapely.errors import GEOSException
-from lib.utils.torch_device import get_torch_device
+from lib.utils.torch_device import get_torch_device, synchronize_device
 
 # --- Geometry sanitization ----------------------------------------------------
 # GEOS may raise TopologyException ("side location conflict") during set-ops on
@@ -162,6 +163,7 @@ _SSN_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 # Cache checkpoint contents once per path and keep reusable models per device.
 _ssn_state_cache: dict = {}
 _ssn_model_cache: dict = {}
+_SSN_REFERENCE_REGION_AREA = float(1400 * 1400 / 500)
 
 
 def _get_ssn_state_dict(abs_path: str):
@@ -180,7 +182,8 @@ def _get_ssn_state_dict(abs_path: str):
     return _ssn_state_cache[abs_path]
 
 
-def _get_ssn_model(weight_path: str, fdim: int, nspix: int, niter: int, device: str = "cpu"):
+def _get_ssn_model(weight_path: str, fdim: int, nspix: int, niter: int,
+                   device: str = "cpu", param_dtype=None):
     """
     Return a cached SSNModel instance on the requested device.
 
@@ -189,7 +192,8 @@ def _get_ssn_model(weight_path: str, fdim: int, nspix: int, niter: int, device: 
     model before each use.
     """
     abs_path = os.path.abspath(weight_path)
-    key = (abs_path, int(fdim), str(device))
+    dtype_key = "float32" if param_dtype is None else str(param_dtype)
+    key = (abs_path, int(fdim), str(device), dtype_key)
 
     if key not in _ssn_model_cache:
         if _SSN_DIR not in _sys_mod.path:
@@ -203,13 +207,16 @@ def _get_ssn_model(weight_path: str, fdim: int, nspix: int, niter: int, device: 
             ) from exc
 
         state = _get_ssn_state_dict(abs_path)
-        model = SSNModel(fdim, nspix, niter).to(device)
+        model = SSNModel(fdim, nspix, niter)
         model.load_state_dict(state)
+        model = model.to(device)
+        if param_dtype is not None:
+            model = model.to(dtype=param_dtype)
         model.eval()
         _ssn_model_cache[key] = model
         logger.info(
-            "SSN model initialised: %s  (fdim=%d  device=%s)",
-            abs_path, fdim, device,
+            "SSN model initialised: %s  (fdim=%d  device=%s  dtype=%s)",
+            abs_path, fdim, device, dtype_key,
         )
 
     model = _ssn_model_cache[key]
@@ -217,6 +224,234 @@ def _get_ssn_model(weight_path: str, fdim: int, nspix: int, niter: int, device: 
     model.n_iter = int(niter)
     model.eval()
     return model
+
+
+def _dynamic_nspix_from_shape(height: int, width: int) -> int:
+    if int(height) <= 0 or int(width) <= 0:
+        return 0
+    return max(2, int((int(height) * int(width)) // _SSN_REFERENCE_REGION_AREA))
+
+
+def _get_ssn_feature_dtype(torch_module, device: str, prefer_fp16: bool = True):
+    if prefer_fp16 and device in {"cuda", "mps"}:
+        return torch_module.float16
+    return torch_module.float32
+
+
+def _build_ssn_model_input_batch(
+    image_lab_batch: Sequence[np.ndarray],
+    *,
+    torch_module,
+    device: str,
+    color_scale: float,
+    pos_scale: float,
+    nspix_context: int,
+    input_dtype,
+):
+    if not image_lab_batch:
+        raise ValueError("image_lab_batch must not be empty")
+
+    height, width = image_lab_batch[0].shape[:2]
+    if any(tuple(arr.shape[:2]) != (height, width) for arr in image_lab_batch):
+        raise ValueError("All SSN ROI batches must have the same HxW shape")
+
+    batch = np.stack(
+        [np.asarray(arr, dtype=np.float32) for arr in image_lab_batch], axis=0
+    )
+    img_t = (
+        torch_module.from_numpy(batch)
+        .permute(0, 3, 1, 2)
+        .to(device=device, dtype=input_dtype)
+    )
+
+    nspix_per_axis = max(1, int(math.sqrt(max(2, int(nspix_context)))))
+    ps = float(pos_scale) * max(nspix_per_axis / height, nspix_per_axis / width)
+    coords = torch_module.stack(
+        torch_module.meshgrid(
+            torch_module.arange(height, device=device, dtype=input_dtype),
+            torch_module.arange(width, device=device, dtype=input_dtype),
+            indexing="ij",
+        ), 0
+    ).unsqueeze(0).expand(len(image_lab_batch), -1, -1, -1)
+
+    return torch_module.cat([float(color_scale) * img_t, ps * coords], dim=1)
+
+
+def _extract_ssn_feature_tensor_batch(
+    image_lab_batch: Sequence[np.ndarray],
+    weight_path: str,
+    *,
+    fdim: int = 20,
+    color_scale: float = 0.26,
+    pos_scale: float = 2.5,
+    nspix_context: int = 100,
+    use_fp16: bool = True,
+    output_float32: bool = True,
+):
+    import torch as _torch
+
+    if not image_lab_batch:
+        raise ValueError("image_lab_batch must not be empty")
+
+    device = get_torch_device(_torch)
+    feature_dtype = _get_ssn_feature_dtype(_torch, device, prefer_fp16=use_fp16)
+    param_dtype = feature_dtype if feature_dtype != _torch.float32 else None
+    model = _get_ssn_model(
+        weight_path,
+        fdim,
+        max(2, int(nspix_context)),
+        niter=5,
+        device=device,
+        param_dtype=param_dtype,
+    )
+    model_input = _build_ssn_model_input_batch(
+        image_lab_batch,
+        torch_module=_torch,
+        device=device,
+        color_scale=color_scale,
+        pos_scale=pos_scale,
+        nspix_context=max(2, int(nspix_context)),
+        input_dtype=feature_dtype,
+    )
+
+    with _torch.no_grad():
+        pixel_f = model.feature_extract(model_input)
+
+    if output_float32 and pixel_f.dtype != _torch.float32:
+        pixel_f = pixel_f.float()
+    return pixel_f
+
+
+def _compute_ssn_feature_maps_batch(
+    image_lab_batch: Sequence[np.ndarray],
+    weight_path: str,
+    *,
+    fdim: int = 20,
+    color_scale: float = 0.26,
+    pos_scale: float = 2.5,
+    nspix_context: int = 100,
+    use_fp16: bool = True,
+) -> List[np.ndarray]:
+    import torch as _torch
+
+    pixel_f = _extract_ssn_feature_tensor_batch(
+        image_lab_batch,
+        weight_path,
+        fdim=fdim,
+        color_scale=color_scale,
+        pos_scale=pos_scale,
+        nspix_context=nspix_context,
+        use_fp16=use_fp16,
+        output_float32=True,
+    )
+    synchronize_device(_torch, str(pixel_f.device).split(":")[0])
+    feature_batch = (
+        pixel_f.detach()
+        .permute(0, 2, 3, 1)
+        .cpu()
+        .numpy()
+        .astype(np.float32, copy=False)
+    )
+    return [feature_batch[i] for i in range(feature_batch.shape[0])]
+
+
+def _compute_ssn_feature_map(
+    image_lab_roi: np.ndarray,
+    weight_path: str,
+    *,
+    fdim: int = 20,
+    color_scale: float = 0.26,
+    pos_scale: float = 2.5,
+    nspix_context: int = 100,
+    use_fp16: bool = True,
+) -> np.ndarray:
+    return _compute_ssn_feature_maps_batch(
+        [image_lab_roi],
+        weight_path,
+        fdim=fdim,
+        color_scale=color_scale,
+        pos_scale=pos_scale,
+        nspix_context=nspix_context,
+        use_fp16=use_fp16,
+    )[0]
+
+
+def _feature_map_to_embeddings(feature_map: np.ndarray) -> np.ndarray:
+    norms = np.linalg.norm(feature_map, axis=-1, keepdims=True)
+    return (feature_map / np.maximum(norms, 1e-8)).astype(np.float32, copy=False)
+
+
+def _run_ssn_feature_inference(
+    feature_map: np.ndarray,
+    *,
+    nspix: int,
+    niter: int,
+    init_spixel_features: Optional[np.ndarray] = None,
+    init_label_map: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    import torch as _torch
+
+    device = get_torch_device(_torch)
+    pixel_f = (
+        _torch.from_numpy(np.asarray(feature_map, dtype=np.float32))
+        .permute(2, 0, 1)
+        .unsqueeze(0)
+        .to(device)
+    )
+    return _run_ssn_feature_tensor_inference(
+        pixel_f,
+        nspix=nspix,
+        niter=niter,
+        init_spixel_features=init_spixel_features,
+        init_label_map=init_label_map,
+    )
+
+
+def _run_ssn_feature_tensor_inference(
+    pixel_f,
+    *,
+    nspix: int,
+    niter: int,
+    init_spixel_features: Optional[np.ndarray] = None,
+    init_label_map: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    import torch as _torch
+
+    if _SSN_DIR not in _sys_mod.path:
+        _sys_mod.path.insert(0, _SSN_DIR)
+    from model import run_ssn_inference  # noqa: PLC0415
+
+    device = str(pixel_f.device).split(":")[0]
+    init_sp_t = None
+    init_label_t = None
+    if init_spixel_features is not None:
+        init_sp_t = _torch.from_numpy(
+            np.asarray(init_spixel_features, dtype=np.float32)
+        )
+        if init_sp_t.ndim == 2:
+            init_sp_t = init_sp_t.unsqueeze(0)
+        init_sp_t = init_sp_t.to(device)
+    if init_label_map is not None:
+        init_label_t = _torch.from_numpy(np.asarray(init_label_map, dtype=np.int64))
+        if init_label_t.ndim == 1:
+            init_label_t = init_label_t.unsqueeze(0)
+        init_label_t = init_label_t.to(device)
+
+    with _torch.no_grad():
+        _, hard_labels, spixel_features = run_ssn_inference(
+            pixel_f,
+            int(nspix),
+            int(niter),
+            init_spixel_features=init_sp_t,
+            init_label_map=init_label_t,
+        )
+
+    synchronize_device(_torch, device)
+    height, width = pixel_f.shape[-2:]
+    return (
+        hard_labels.reshape(height, width).detach().cpu().numpy().astype(np.int32),
+        spixel_features.squeeze(0).detach().cpu().numpy().astype(np.float32),
+    )
 
 
 def _compute_roi_embeddings(
@@ -242,42 +477,16 @@ def _compute_roi_embeddings(
     -------
     emb : np.ndarray  (H, W, fdim)  float32, each pixel vector is L2-normalised
     """
-    import math as _math
-    import torch as _torch
-
-    H, W = image_lab_roi.shape[:2]
-    device = get_torch_device(_torch)
-
-    # load/cache model (nspix/niter irrelevant for feature_extract; use canonical defaults)
-    model = _get_ssn_model(weight_path, fdim, nspix=100, niter=5, device=device)
-
-    img_t = (
-        _torch.from_numpy(image_lab_roi.astype(np.float32))
-        .permute(2, 0, 1).unsqueeze(0).to(device)
-    )  # (1, 3, H, W)
-
-    # same coordinate scaling formula as compute_superpixels
-    nspix_per_axis = int(_math.sqrt(100))
-    ps = pos_scale * max(nspix_per_axis / H, nspix_per_axis / W)
-    coords = _torch.stack(
-        _torch.meshgrid(
-            _torch.arange(H, device=device, dtype=_torch.float32),
-            _torch.arange(W, device=device, dtype=_torch.float32),
-            indexing="ij",
-        ), 0
-    ).unsqueeze(0)  # (1, 2, H, W)
-
-    model_input = _torch.cat([color_scale * img_t, ps * coords], dim=1)  # (1, 5, H, W)
-
-    with _torch.no_grad():
-        pixel_f = model.feature_extract(model_input)  # (1, fdim, H, W)
-
-    emb = pixel_f.squeeze(0).permute(1, 2, 0).cpu().numpy()  # (H, W, fdim)
-
-    # L2-normalise per pixel
-    norms = np.linalg.norm(emb, axis=-1, keepdims=True)
-    emb = (emb / np.maximum(norms, 1e-8)).astype(np.float32)
-    return emb
+    feature_map = _compute_ssn_feature_map(
+        image_lab_roi,
+        weight_path,
+        fdim=fdim,
+        color_scale=color_scale,
+        pos_scale=pos_scale,
+        nspix_context=100,
+        use_fp16=True,
+    )
+    return _feature_map_to_embeddings(feature_map)
 
 
 # ── Typing aliases ─────────────────────────────────────────────────────────────
@@ -758,6 +967,7 @@ class AnnotationInstance:
     parent_superpixel: int
     parent_scribble: List[int] = field(default_factory=list)
     parent_intersect: bool = True
+    propagation_score: Optional[float] = None
 
     def dict_to_save(self) -> Dict:
         return {
@@ -767,6 +977,9 @@ class AnnotationInstance:
             "parent_superpixel": int(self.parent_superpixel),
             "parent_scribble": [int(i) for i in self.parent_scribble],
             "parent_intersect": bool(self.parent_intersect),
+            "propagation_score": (
+                None if self.propagation_score is None else float(self.propagation_score)
+            ),
         }
 
     @staticmethod
@@ -778,6 +991,11 @@ class AnnotationInstance:
             parent_superpixel=int(d.get("parent_superpixel", -1)),
             parent_scribble=[int(i) for i in d.get("parent_scribble", [])],
             parent_intersect=bool(d.get("parent_intersect", True)),
+            propagation_score=(
+                None
+                if d.get("propagation_score") is None
+                else float(d.get("propagation_score"))
+            ),
         )
 
     def set_from_dict(self, loaded_dict: Dict):
@@ -788,6 +1006,7 @@ class AnnotationInstance:
         self.parent_superpixel = a.parent_superpixel
         self.parent_scribble = a.parent_scribble
         self.parent_intersect = a.parent_intersect
+        self.propagation_score = a.propagation_score
 
 
 @dataclass
@@ -1920,8 +2139,7 @@ def compute_superpixels(
     if H == 0 or W == 0:
         return np.zeros((H, W), dtype=np.int32)
     num_pixel_in_roi = H * W
-    sp_size = 1400 * 1400 / 500
-    n_segment_dynamic = num_pixel_in_roi // sp_size
+    n_segment_dynamic = _dynamic_nspix_from_shape(H, W)
     has_mask = mask is not None
     if has_mask:
         mask = mask.astype(bool)
@@ -1980,51 +2198,28 @@ def compute_superpixels(
 
     # --- SSN (Superpixel Sampling Network) ---
     if isinstance(method, SSNSuperpixel):
-        import math as _math
-        import torch as _torch
-
-        device = get_torch_device(_torch)
-        model = _get_ssn_model(
+        feature_t = _extract_ssn_feature_tensor_batch(
+            [image_lab],
             method.weight_path,
-            method.fdim,
-            n_segment_dynamic,
-            method.niter,
-            device=device,
+            fdim=method.fdim,
+            color_scale=method.color_scale,
+            pos_scale=method.pos_scale,
+            nspix_context=n_segment_dynamic,
+            use_fp16=True,
+            output_float32=False,
         )
-
-        # LAB image → float32 tensor (1, 3, H, W)
-        img_t = (
-            _torch.from_numpy(image_lab.astype(np.float32))
-            .permute(2, 0, 1).unsqueeze(0).to(device)
+        hard_labels, _ = _run_ssn_feature_tensor_inference(
+            feature_t,
+            nspix=n_segment_dynamic,
+            niter=method.niter,
         )
-
-        # Coordinate grid (1, 2, H, W) — plain pixel indices
-        nspix_per_axis = int(_math.sqrt(n_segment_dynamic))
-        ps = method.pos_scale * max(nspix_per_axis / H, nspix_per_axis / W)
-        coords = _torch.stack(
-            _torch.meshgrid(
-                _torch.arange(H, device=device, dtype=_torch.float32),
-                _torch.arange(W, device=device, dtype=_torch.float32),
-                indexing="ij",
-            ), 0
-        ).unsqueeze(0)  # (1, 2, H, W)
-
-        model_input = _torch.cat(
-            [method.color_scale * img_t, ps * coords], dim=1
-        )  # (1, 5, H, W)
-
-        with _torch.no_grad():
-            _, hard_labels, _ = model(model_input)
-        # hard_labels: (1, H*W) — 0-indexed superpixel IDs
-        labels = (
-            hard_labels.reshape(H, W).cpu().numpy().astype(np.int32) + 1
-        )  # shift to 1-indexed (0 = background/masked)
+        labels = hard_labels.astype(np.int32, copy=False) + 1
 
         if has_mask:
             labels[~mask] = 0
         return _postprocess_superpixel_labels(
             labels,
-            nspix_hint=max(2, int(n_segment_dynamic)),
+            nspix_hint=n_segment_dynamic,
             mask=mask if has_mask else None,
             # For SSN we always want tiny / thread-like fragments to merge
             # into neighbouring superpixels after connectivity splitting.
@@ -2114,6 +2309,13 @@ class SuperPixelAnnotationAlgo:
         self.embedding_pos_scale: float = 2.5
         self._embedding_threshold: float = 0.99   # minimum cosine similarity to propagate
         self._pixel_embedding_cache: Dict[Tuple[str, int, float, float], np.ndarray] = {}
+        self.use_ssn_fp16: bool = True
+        self.use_ssn_roi_feature_cache: bool = True
+        self.use_ssn_assignment_warm_start: bool = True
+        self.ssn_feature_batch_size: int = 8
+        self._ssn_feature_cache: Dict[Tuple[Any, ...], np.ndarray] = {}
+        self._ssn_roi_assignment_cache: Dict[Tuple[Any, ...], np.ndarray] = {}
+        self._ssn_roi_label_cache: Dict[Tuple[Any, ...], np.ndarray] = {}
 
         self._create_superpixels()
         self._mark_sp_index_dirty()
@@ -2184,6 +2386,209 @@ class SuperPixelAnnotationAlgo:
         self.embedding_color_scale = float(sp_method.color_scale)
         self.embedding_pos_scale = float(sp_method.pos_scale)
 
+    @staticmethod
+    def _ssn_feature_cache_key(
+        *,
+        weight_path: str,
+        fdim: int,
+        color_scale: float,
+        pos_scale: float,
+        nspix_context: int,
+        roi_px: Tuple[int, int, int, int],
+    ) -> Tuple[Any, ...]:
+        return (
+            os.path.abspath(weight_path),
+            int(fdim),
+            float(color_scale),
+            float(pos_scale),
+            int(nspix_context),
+            tuple(int(v) for v in roi_px),
+        )
+
+    @staticmethod
+    def _ssn_assignment_cache_key(
+        sp_method: SSNSuperpixel,
+        roi_px: Tuple[int, int, int, int],
+        nspix_context: int,
+    ) -> Tuple[Any, ...]:
+        return (
+            sp_method.short_string(),
+            tuple(int(v) for v in roi_px),
+            int(nspix_context),
+        )
+
+    @staticmethod
+    def _ssn_roi_label_cache_key(
+        sp_method: SSNSuperpixel,
+        roi_px: Tuple[int, int, int, int],
+        nspix_context: int,
+        mask: np.ndarray,
+    ) -> Tuple[Any, ...]:
+        mask_u8 = np.ascontiguousarray(mask.astype(np.uint8, copy=False))
+        return (
+            sp_method.short_string(),
+            tuple(int(v) for v in roi_px),
+            int(nspix_context),
+            hashlib.sha1(mask_u8.tobytes()).hexdigest(),
+        )
+
+    def _get_cached_ssn_feature_map(
+        self,
+        image_lab_roi: np.ndarray,
+        *,
+        weight_path: str,
+        fdim: int,
+        color_scale: float,
+        pos_scale: float,
+        nspix_context: int,
+        roi_px: Tuple[int, int, int, int],
+    ) -> np.ndarray:
+        key = self._ssn_feature_cache_key(
+            weight_path=weight_path,
+            fdim=fdim,
+            color_scale=color_scale,
+            pos_scale=pos_scale,
+            nspix_context=nspix_context,
+            roi_px=roi_px,
+        )
+        if not self.use_ssn_roi_feature_cache:
+            return _compute_ssn_feature_map(
+                image_lab_roi,
+                weight_path,
+                fdim=fdim,
+                color_scale=color_scale,
+                pos_scale=pos_scale,
+                nspix_context=nspix_context,
+                use_fp16=self.use_ssn_fp16,
+            )
+        cached = self._ssn_feature_cache.get(key)
+        if cached is None:
+            cached = _compute_ssn_feature_map(
+                image_lab_roi,
+                weight_path,
+                fdim=fdim,
+                color_scale=color_scale,
+                pos_scale=pos_scale,
+                nspix_context=nspix_context,
+                use_fp16=self.use_ssn_fp16,
+            )
+            self._ssn_feature_cache[key] = cached
+        return cached
+
+    def precompute_ssn_roi_feature_cache(
+        self,
+        sp_method: SuperPixelMethod,
+        rois_px: Sequence[Tuple[int, int, int, int]],
+    ) -> int:
+        if not isinstance(sp_method, SSNSuperpixel):
+            return 0
+
+        grouped: Dict[Tuple[int, int, int], List[Tuple[Tuple[int, int, int, int], np.ndarray]]] = {}
+        for roi_px in rois_px:
+            x0, y0, x1, y1 = [int(v) for v in roi_px]
+            if x1 <= x0 or y1 <= y0:
+                continue
+            image_roi = self.image_lab[y0:y1, x0:x1]
+            if image_roi.size == 0:
+                continue
+            nspix_context = _dynamic_nspix_from_shape(image_roi.shape[0], image_roi.shape[1])
+            key = self._ssn_feature_cache_key(
+                weight_path=sp_method.weight_path,
+                fdim=sp_method.fdim,
+                color_scale=sp_method.color_scale,
+                pos_scale=sp_method.pos_scale,
+                nspix_context=nspix_context,
+                roi_px=(x0, y0, x1, y1),
+            )
+            if key in self._ssn_feature_cache:
+                continue
+            grouped.setdefault(
+                (image_roi.shape[0], image_roi.shape[1], nspix_context),
+                [],
+            ).append(((x0, y0, x1, y1), image_roi))
+
+        computed = 0
+        batch_size = max(1, int(self.ssn_feature_batch_size))
+        for (height, width, nspix_context), items in grouped.items():
+            del height, width  # shape only used for grouping
+            for start in range(0, len(items), batch_size):
+                batch = items[start:start + batch_size]
+                feature_maps = _compute_ssn_feature_maps_batch(
+                    [image_roi for _, image_roi in batch],
+                    sp_method.weight_path,
+                    fdim=sp_method.fdim,
+                    color_scale=sp_method.color_scale,
+                    pos_scale=sp_method.pos_scale,
+                    nspix_context=nspix_context,
+                    use_fp16=self.use_ssn_fp16,
+                )
+                for (roi_px, _), feature_map in zip(batch, feature_maps):
+                    key = self._ssn_feature_cache_key(
+                        weight_path=sp_method.weight_path,
+                        fdim=sp_method.fdim,
+                        color_scale=sp_method.color_scale,
+                        pos_scale=sp_method.pos_scale,
+                        nspix_context=nspix_context,
+                        roi_px=roi_px,
+                    )
+                    self._ssn_feature_cache[key] = feature_map
+                    computed += 1
+        return computed
+
+    def _compute_ssn_superpixels_for_roi(
+        self,
+        sp_method: SSNSuperpixel,
+        image_roi: np.ndarray,
+        mask: np.ndarray,
+        roi_px: Tuple[int, int, int, int],
+    ) -> np.ndarray:
+        height, width = image_roi.shape[:2]
+        if height == 0 or width == 0:
+            return np.zeros((height, width), dtype=np.int32)
+
+        nspix_context = _dynamic_nspix_from_shape(height, width)
+        mask_bool = mask.astype(bool, copy=False)
+        label_cache_key = self._ssn_roi_label_cache_key(
+            sp_method, roi_px, nspix_context, mask_bool
+        )
+        cached_labels = self._ssn_roi_label_cache.get(label_cache_key)
+        if cached_labels is not None:
+            return cached_labels.copy()
+
+        feature_map = self._get_cached_ssn_feature_map(
+            image_roi,
+            weight_path=sp_method.weight_path,
+            fdim=sp_method.fdim,
+            color_scale=sp_method.color_scale,
+            pos_scale=sp_method.pos_scale,
+            nspix_context=nspix_context,
+            roi_px=roi_px,
+        )
+        cache_key = self._ssn_assignment_cache_key(sp_method, roi_px, nspix_context)
+        warm_start = None
+        if self.use_ssn_assignment_warm_start:
+            warm_start = self._ssn_roi_assignment_cache.get(cache_key)
+
+        hard_labels, spixel_features = _run_ssn_feature_inference(
+            feature_map,
+            nspix=nspix_context,
+            niter=sp_method.niter,
+            init_spixel_features=warm_start,
+        )
+        if self.use_ssn_assignment_warm_start:
+            self._ssn_roi_assignment_cache[cache_key] = spixel_features
+
+        labels = hard_labels.astype(np.int32, copy=False) + 1
+        labels[~mask_bool] = 0
+        labels = _postprocess_superpixel_labels(
+            labels,
+            nspix_hint=nspix_context,
+            mask=mask_bool,
+            prune_small_thin=True,
+        )
+        self._ssn_roi_label_cache[label_cache_key] = labels.copy()
+        return labels
+
     # ---- Superpixel generation around scribble ----
     def _exist_sp_mask(self, scribble: Scribble) -> bool:
         return check_bbox_contain_scribble(scribble.points, self.annotated_bbox)
@@ -2200,12 +2605,23 @@ class SuperPixelAnnotationAlgo:
         self._ensure_embedding_defaults_for_method(superpixel_method)
         if image_roi.size == 0 or mask.size == 0 or not np.any(mask):
             return 0
-        sp_mask = compute_superpixels(
-            image_roi,
-            superpixel_method,
-            mask=mask,
-            embedding_guided_cleanup=bool(self.embedding_weight_path),
+        roi_px = _bbox_to_pixel_rect(
+            tuple(bbox), self.image_lab.shape[1], self.image_lab.shape[0]
         )
+        if isinstance(superpixel_method, SSNSuperpixel):
+            sp_mask = self._compute_ssn_superpixels_for_roi(
+                superpixel_method,
+                image_roi,
+                mask,
+                roi_px,
+            )
+        else:
+            sp_mask = compute_superpixels(
+                image_roi,
+                superpixel_method,
+                mask=mask,
+                embedding_guided_cleanup=bool(self.embedding_weight_path),
+            )
         if sp_mask.size == 0:
             return 0
         means, variances, valid_labels = parallel_stats_rgb(
@@ -2217,13 +2633,19 @@ class SuperPixelAnnotationAlgo:
         label_embs: dict = {}
         if self.embedding_weight_path:
             try:
-                pixel_emb = _compute_roi_embeddings(
-                    image_roi,
-                    self.embedding_weight_path,
-                    fdim=self.embedding_fdim,
-                    color_scale=self.embedding_color_scale,
-                    pos_scale=self.embedding_pos_scale,
-                )  # (H_roi, W_roi, fdim)
+                pixel_emb = None
+                full_emb = self._get_full_image_pixel_embeddings()
+                if full_emb is not None:
+                    ix0, iy0, ix1, iy1 = roi_px
+                    pixel_emb = full_emb[iy0:iy1, ix0:ix1]
+                if pixel_emb is None or tuple(pixel_emb.shape[:2]) != tuple(sp_mask.shape):
+                    pixel_emb = _compute_roi_embeddings(
+                        image_roi,
+                        self.embedding_weight_path,
+                        fdim=self.embedding_fdim,
+                        color_scale=self.embedding_color_scale,
+                        pos_scale=self.embedding_pos_scale,
+                    )  # (H_roi, W_roi, fdim)
                 for lab in valid_labels:
                     if lab <= 0:
                         continue
@@ -2465,6 +2887,10 @@ class SuperPixelAnnotationAlgo:
         self._prepared_scr_geoms = {}             # буферизованные геометрии штрихов
         self._prepared_sp_polys = {}              # prepared-polygons для SP
         self._sp_index_version = 0                # инкрементировать при любых изменениях SP
+        self._pixel_embedding_cache = {}
+        self._ssn_feature_cache = {}
+        self._ssn_roi_assignment_cache = {}
+        self._ssn_roi_label_cache = {}
 
         # вернуть картинку при необходимости
         if keep_image:
@@ -2859,13 +3285,17 @@ class SuperPixelAnnotationAlgo:
         )
         if key not in self._pixel_embedding_cache:
             try:
-                self._pixel_embedding_cache[key] = _compute_roi_embeddings(
+                full_roi = (0, 0, self.image_lab.shape[1], self.image_lab.shape[0])
+                feature_map = self._get_cached_ssn_feature_map(
                     self.image_lab,
-                    self.embedding_weight_path,
+                    weight_path=self.embedding_weight_path,
                     fdim=self.embedding_fdim,
                     color_scale=self.embedding_color_scale,
                     pos_scale=self.embedding_pos_scale,
+                    nspix_context=100,
+                    roi_px=full_roi,
                 )
+                self._pixel_embedding_cache[key] = _feature_map_to_embeddings(feature_map)
             except Exception as exc:
                 logger.warning("Full-image embedding computation failed: %s", exc)
                 return None
@@ -2971,6 +3401,23 @@ class SuperPixelAnnotationAlgo:
     def _is_split_descendant(sp: SuperPixel) -> bool:
         return bool(getattr(sp, "parents", None))
 
+    @staticmethod
+    def _normalized_prop_similarity(
+        cand_props: Optional[np.ndarray],
+        seed_props: Optional[np.ndarray],
+        sens: float,
+        property_scale: float,
+        property_dist: float,
+    ) -> Optional[float]:
+        if cand_props is None or seed_props is None:
+            return None
+        limit = float(property_dist) * float(sens) * max(0.0, float(property_scale))
+        if limit <= 1e-12:
+            return None
+        diff = np.abs(np.asarray(cand_props, dtype=np.float32) - np.asarray(seed_props, dtype=np.float32))
+        ratio = float(np.max(diff) / limit)
+        return float(np.clip(1.0 - ratio, 0.0, 1.0))
+
     def use_sensitivity_for_region(
         self,
         sp_idx: int,
@@ -3061,19 +3508,26 @@ class SuperPixelAnnotationAlgo:
                     continue
 
                 # 2) Сходство признаков — эмбединги (если есть) или LAB props
+                similarity_score: Optional[float] = None
                 if ref_emb is not None and cand_sp.emb is not None:
                     # cosine similarity against the class prototype / seed mean embedding
                     cos_sim = float(np.dot(ref_emb, cand_sp.emb))
                     if cos_sim < emb_threshold:
                         continue
+                    similarity_score = cos_sim
                 else:
                     if cand_sp.props is None or seed_props is None:
                         continue
-                    if not np.all(
-                        np.abs(cand_sp.props - seed_props)
-                        < (self._property_dist * sens * max(0.0, property_scale))
-                    ):
+                    limit = self._property_dist * sens * max(0.0, property_scale)
+                    if not np.all(np.abs(cand_sp.props - seed_props) < limit):
                         continue
+                    similarity_score = self._normalized_prop_similarity(
+                        cand_props=cand_sp.props,
+                        seed_props=seed_props,
+                        sens=sens,
+                        property_scale=property_scale,
+                        property_dist=self._property_dist,
+                    )
 
                 # 3) Аннотирование
                 parent_intersect = cand_poly.intersects(seed_line_buf)
@@ -3087,12 +3541,29 @@ class SuperPixelAnnotationAlgo:
                         visited.add(nb)
                         continue
 
+                    prev_score = (
+                        float(anno_obj.propagation_score)
+                        if anno_obj.propagation_score is not None
+                        else float("-inf")
+                    )
+                    new_score = (
+                        float(similarity_score)
+                        if similarity_score is not None
+                        else float("-inf")
+                    )
+                    if new_score <= prev_score:
+                        visited.add(nb)
+                        continue
+
                     prev_sids = [int(s) for s in (anno_obj.parent_scribble or [])]
                     if int(scribble.id) not in prev_sids:
                         prev_sids.append(int(scribble.id))
                     anno_obj.code = seed_code
                     anno_obj.parent_scribble = prev_sids
                     anno_obj.parent_intersect = bool(parent_intersect)
+                    anno_obj.propagation_score = (
+                        None if similarity_score is None else float(similarity_score)
+                    )
                     visited.add(nb)
                     continue
                 else:
@@ -3104,11 +3575,14 @@ class SuperPixelAnnotationAlgo:
                             parent_superpixel=int(cand_sp.id),
                             parent_scribble=[scribble.id],
                             parent_intersect=bool(parent_intersect),
+                            propagation_score=(
+                                None if similarity_score is None else float(similarity_score)
+                            ),
                         )
                     )
                     self._annotation_ind[sp_method] += 1
                 visited.add(nb)
-                queue.append(nb)
+                # queue.append(nb)
 
     # backward-compat alias
     def use_sensetivity_for_region(self, *args, **kwargs):
@@ -3449,6 +3923,12 @@ class SuperPixelAnnotationAlgo:
                 anno.code = int(upd["code"])
             if "parent_intersect" in upd:
                 anno.parent_intersect = bool(upd["parent_intersect"])
+            if "propagation_score" in upd:
+                anno.propagation_score = (
+                    None
+                    if upd["propagation_score"] is None
+                    else float(upd["propagation_score"])
+                )
 
         # удаление SP и аннотаций под сплит
         for sp_to_del in sorted(superpixel_ind_to_del, reverse=True):

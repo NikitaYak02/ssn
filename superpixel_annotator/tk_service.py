@@ -64,19 +64,21 @@ class ScribbleApp:
         # цвета маркеров
         self.markers = OrderedDict(
             {
-                "background": "#1c1818",
-                "chalcopyrite": "#ff0000",
-                "galena": "#cbff00",
-                "magnetite": "#00ff66",
-                "bornite": "#0065ff",
-                "pyrrhotite": "#cc00ff",
-                "pyrite/marcasite": "#ff4c4c",
-                "pentlandite": "#dbff4c",
-                "sphalerite": "#4cff93",
-                "arsenopyrite": "#4c93ff",
-                "hematite": "#db4cff",
-                "tenantite-tetrahedrite group": "#ff9999",
-                "covelline": "#eaff99",
+                "background": "#000000",
+                "chalcopyrite": "#ffa500",
+                "galena": "#9acd32",
+                "magnetite": "#ff4500",
+                "bornite": "#00bfff",
+                "pyrrhotite": "#a9a9a9",
+                "pyrite": "#2f4f4f",
+                "pentlandite": "#ffff00",
+                "sphalerite": "#ee82ee",
+                "arsenopyrite": "#556b2f",
+                "hematite": "#a0522d",
+                "tenantite": "#483d8b",
+                "covellite": "#008000",
+                "marcasite": "#00008b",
+                "native gold": "#8b008b",
             }
         )
         """

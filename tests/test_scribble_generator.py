@@ -180,6 +180,62 @@ def test_generator_switches_candidate_after_no_progress():
     assert second_gt_id == 2
 
 
+def test_generator_cycles_region_selection_modes_within_one_run():
+    gt = np.array(
+        [
+            [1, 1, 1, 1, 0, 0, 2, 2, 0, 3, 3, 3, 3, 3],
+            [1, 1, 1, 1, 0, 0, 2, 2, 0, 3, 3, 3, 3, 3],
+            [1, 1, 1, 1, 0, 0, 0, 0, 0, 3, 3, 3, 3, 3],
+            [1, 1, 1, 1, 0, 0, 0, 0, 0, 3, 3, 3, 3, 3],
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 3, 3, 3, 3],
+        ],
+        dtype=np.int32,
+    )
+    pred = gt.copy()
+
+    pred[0, 0] = 0
+    pred[0, 1] = 0
+    pred[1, 0] = 0
+    pred[1, 1] = 0
+    pred[2, 0] = 0
+
+    pred[0, 6] = 0
+    pred[0, 7] = 0
+
+    pred[0, 9] = -1
+    pred[0, 10] = -1
+    pred[1, 9] = -1
+    pred[1, 10] = -1
+    pred[2, 9] = -1
+    pred[2, 10] = -1
+
+    gen = interactive_eval.LargestBadRegionGenerator(
+        gt_mask=gt,
+        num_classes=4,
+        seed=0,
+        margin=0,
+        border_margin=0,
+        no_overlap=False,
+        region_selection_cycle=["miou_gain", "largest_error", "unannotated"],
+    )
+
+    first_gt_id, _ = gen.make_scribble(pred, np.zeros_like(gt, dtype=bool))
+    second_gt_id, _ = gen.make_scribble(pred, np.zeros_like(gt, dtype=bool))
+    third_gt_id, _ = gen.make_scribble(pred, np.zeros_like(gt, dtype=bool))
+
+    assert first_gt_id == 2
+    assert second_gt_id == 1
+    assert third_gt_id == 3
+
+
+def test_parse_region_selection_cycle_from_cli_string():
+    parsed = interactive_eval.parse_region_selection_cycle(
+        "miou_gain, largest_error, unannotated"
+    )
+
+    assert parsed == ["miou_gain", "largest_error", "unannotated"]
+
+
 def test_lookahead_prefers_long_axis_for_elongated_region():
     gt = np.zeros((10, 24), dtype=np.int32)
     gt[3:7, 3:21] = 1

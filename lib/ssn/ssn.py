@@ -5,7 +5,47 @@ from .pair_wise_distance import PairwiseDistFunction
 from ..utils.sparse_utils import naive_sparse_bmm
 
 
-def calc_init_centroid(images, num_spixels_width, num_spixels_height):
+_INIT_LABEL_MAP_CACHE = {}
+
+
+def _resolve_spixel_grid(height, width, num_spixels):
+    num_spixels_width = int(math.sqrt(num_spixels * width / height))
+    num_spixels_height = int(math.sqrt(num_spixels * height / width))
+    num_spixels_actual = num_spixels_width * num_spixels_height
+    return num_spixels_width, num_spixels_height, num_spixels_actual
+
+
+@torch.no_grad()
+def _get_cached_init_label_map(batchsize, height, width, num_spixels_width,
+                               num_spixels_height, device):
+    """
+    Return the regular-grid init label map reused across repeated calls with the
+    same geometry. This avoids rebuilding the same interpolated grid every time.
+    """
+    key = (
+        int(height),
+        int(width),
+        int(num_spixels_width),
+        int(num_spixels_height),
+        str(device),
+    )
+    cached = _INIT_LABEL_MAP_CACHE.get(key)
+    if cached is None:
+        num_spixels = num_spixels_width * num_spixels_height
+        labels = torch.arange(
+            num_spixels, device=device, dtype=torch.float32
+        ).reshape(1, 1, num_spixels_height, num_spixels_width)
+        cached = torch.nn.functional.interpolate(
+            labels, size=(height, width), mode="nearest"
+        ).reshape(1, -1).long()
+        _INIT_LABEL_MAP_CACHE[key] = cached
+
+    if int(batchsize) == 1:
+        return cached
+    return cached.repeat(int(batchsize), 1)
+
+
+def calc_init_centroid(images, num_spixels_width, num_spixels_height, init_label_map=None):
     """
     Calculate initial superpixel centroids and label map.
 
@@ -18,21 +58,51 @@ def calc_init_centroid(images, num_spixels_width, num_spixels_height):
     batchsize, channels, height, width = images.shape
     device = images.device
 
-    centroids = torch.nn.functional.adaptive_avg_pool2d(
-        images, (num_spixels_height, num_spixels_width))
+    if init_label_map is None:
+        init_label_map = _get_cached_init_label_map(
+            batchsize=batchsize,
+            height=height,
+            width=width,
+            num_spixels_width=num_spixels_width,
+            num_spixels_height=num_spixels_height,
+            device=device,
+        )
+    else:
+        init_label_map = init_label_map.reshape(batchsize, -1).to(device=device).long()
 
-    with torch.no_grad():
-        num_spixels = num_spixels_width * num_spixels_height
-        labels = torch.arange(num_spixels, device=device).reshape(
-            1, 1, *centroids.shape[-2:]).type_as(centroids)
-        init_label_map = torch.nn.functional.interpolate(
-            labels, size=(height, width), mode="nearest")
-        init_label_map = init_label_map.repeat(batchsize, 1, 1, 1)
+    num_spixels = num_spixels_width * num_spixels_height
+    images_flat = images.reshape(batchsize, channels, -1)
+    centroid_sums = images.new_zeros(batchsize, channels, num_spixels)
+    centroid_counts = images.new_zeros(batchsize, 1, num_spixels)
+    scatter_idx = init_label_map.unsqueeze(1).expand(-1, channels, -1)
 
-    init_label_map = init_label_map.reshape(batchsize, -1)
-    centroids = centroids.reshape(batchsize, channels, -1)
+    centroid_sums.scatter_add_(2, scatter_idx, images_flat)
+    centroid_counts.scatter_add_(
+        2,
+        init_label_map.unsqueeze(1),
+        images.new_ones(batchsize, 1, height * width),
+    )
+    centroids = centroid_sums / (centroid_counts + 1e-6)
 
     return centroids, init_label_map
+
+
+@torch.no_grad()
+def get_initial_label_map(batchsize, height, width, num_spixels, device):
+    """
+    Return the cached regular-grid init label map for a given geometry.
+    """
+    num_spixels_width, num_spixels_height, _ = _resolve_spixel_grid(
+        height, width, num_spixels,
+    )
+    return _get_cached_init_label_map(
+        batchsize=batchsize,
+        height=height,
+        width=width,
+        num_spixels_width=num_spixels_width,
+        num_spixels_height=num_spixels_height,
+        device=device,
+    )
 
 
 @torch.no_grad()
@@ -122,9 +192,9 @@ def sparse_ssn_iter(pixel_features, num_spixels, n_iter):
     Does NOT compute gradients.
     """
     height, width = pixel_features.shape[-2:]
-    num_spixels_width  = int(math.sqrt(num_spixels * width  / height))
-    num_spixels_height = int(math.sqrt(num_spixels * height / width))
-    num_spixels_actual = num_spixels_width * num_spixels_height
+    num_spixels_width, num_spixels_height, num_spixels_actual = _resolve_spixel_grid(
+        height, width, num_spixels,
+    )
 
     spixel_features, init_label_map = calc_init_centroid(
         pixel_features, num_spixels_width, num_spixels_height)
@@ -157,6 +227,107 @@ def sparse_ssn_iter(pixel_features, num_spixels, n_iter):
     return sparse_abs_affinity, hard_labels, spixel_features
 
 
+@torch.no_grad()
+def dense_ssn_iter_inference(pixel_features, num_spixels, n_iter,
+                             init_spixel_features=None, init_label_map=None):
+    """
+    Dense inference path that stays on the active device.
+
+    Unlike ``ssn_iter``, this function avoids materialising the full dense
+    (B, S, N) assignment tensor. Instead it directly scatters weighted pixel
+    features into centroid accumulators, which keeps memory bounded enough for
+    inference on MPS/CUDA while still avoiding the sparse CPU fallback.
+
+    Optional ``init_spixel_features`` and ``init_label_map`` provide a
+    warm-start for repeated refinement of the same ROI.
+    """
+    height, width = pixel_features.shape[-2:]
+    num_spixels_width, num_spixels_height, num_spixels_actual = _resolve_spixel_grid(
+        height, width, num_spixels,
+    )
+
+    if init_label_map is None:
+        init_label_map = get_initial_label_map(
+            batchsize=pixel_features.shape[0],
+            height=height,
+            width=width,
+            num_spixels=num_spixels,
+            device=pixel_features.device,
+        )
+
+    if init_spixel_features is None:
+        spixel_features, init_label_map = calc_init_centroid(
+            pixel_features, num_spixels_width, num_spixels_height,
+            init_label_map=init_label_map,
+        )
+    else:
+        spixel_features = init_spixel_features.to(
+            device=pixel_features.device, dtype=pixel_features.dtype
+        )
+        init_label_map = init_label_map.reshape(pixel_features.shape[0], -1).to(
+            device=pixel_features.device
+        ).long()
+
+    B, C, _, _ = pixel_features.shape
+    pixel_features = pixel_features.reshape(B, C, -1).contiguous()  # (B, C, N)
+    N = pixel_features.shape[2]
+    device_type = pixel_features.device.type
+
+    query_idx, valid = _build_query_idx(
+        init_label_map, num_spixels_width, num_spixels_height, num_spixels_actual
+    )
+    if device_type == "mps":
+        chunk_size = min(N, 32768)
+    elif device_type == "cuda":
+        chunk_size = min(N, 262144)
+    else:
+        chunk_size = N
+
+    hard_labels = None
+    for iter_idx in range(n_iter):
+        spixel_sums = pixel_features.new_zeros(B, C, num_spixels_actual)
+        spixel_weights = pixel_features.new_zeros(B, 1, num_spixels_actual)
+        if iter_idx == n_iter - 1:
+            hard_labels = init_label_map.new_empty(B, N)
+
+        for start in range(0, N, chunk_size):
+            end = min(N, start + chunk_size)
+            pixel_chunk = pixel_features[:, :, start:end]
+            init_chunk = init_label_map[:, start:end]
+            query_chunk = query_idx[:, :, start:end]
+            valid_chunk = valid[:, :, start:end].to(dtype=pixel_features.dtype)
+
+            dist_matrix = PairwiseDistFunction.apply(
+                pixel_chunk,
+                spixel_features,
+                init_chunk,
+                num_spixels_width,
+                num_spixels_height,
+            )
+            affinity_matrix = (-dist_matrix).softmax(1)  # (B, 9, chunk)
+            src = affinity_matrix * valid_chunk
+
+            for neighbor_idx in range(9):
+                target_idx = query_chunk[:, neighbor_idx, :]          # (B, chunk)
+                weights = src[:, neighbor_idx, :].unsqueeze(1)        # (B, 1, chunk)
+                target_idx_feat = target_idx.unsqueeze(1).expand(-1, C, -1)
+
+                spixel_sums.scatter_add_(2, target_idx_feat, pixel_chunk * weights)
+                spixel_weights.scatter_add_(2, target_idx.unsqueeze(1), weights)
+
+            if hard_labels is not None:
+                hard_labels[:, start:end] = get_hard_abs_labels(
+                    affinity_matrix,
+                    init_chunk,
+                    num_spixels_width,
+                    num_spixels_actual,
+                )
+
+        spixel_features = spixel_sums / (spixel_weights + 1e-6)
+
+    return None, hard_labels, spixel_features
+
+
 # ---------------------------------------------------------------------------
 # Training path — dense scatter_add (supports autograd)
 # ---------------------------------------------------------------------------
@@ -176,9 +347,9 @@ def ssn_iter(pixel_features, num_spixels, n_iter):
       and replaces them with one scatter_add_ (a single fused CUDA kernel).
     """
     height, width = pixel_features.shape[-2:]
-    num_spixels_width  = int(math.sqrt(num_spixels * width  / height))
-    num_spixels_height = int(math.sqrt(num_spixels * height / width))
-    num_spixels_actual = num_spixels_width * num_spixels_height
+    num_spixels_width, num_spixels_height, num_spixels_actual = _resolve_spixel_grid(
+        height, width, num_spixels,
+    )
 
     spixel_features, init_label_map = calc_init_centroid(
         pixel_features, num_spixels_width, num_spixels_height)

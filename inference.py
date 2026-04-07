@@ -6,7 +6,7 @@ from lib.utils.color_conv import rgb2lab
 from lib.utils.torch_device import get_torch_device, synchronize_device
 from skimage.segmentation._slic import _enforce_label_connectivity_cython
 
-from lib.ssn.ssn import sparse_ssn_iter
+from model import run_ssn_inference
 
 
 @torch.no_grad()
@@ -39,7 +39,7 @@ def inference(image, nspix, n_iter, fdim=None, color_scale=0.26,
         model.load_state_dict(state)
         model.eval()
     else:
-        model = lambda data: sparse_ssn_iter(data, nspix, n_iter)
+        model = lambda data: run_ssn_inference(data, nspix, n_iter)
 
     height, width = image.shape[:2]
 
