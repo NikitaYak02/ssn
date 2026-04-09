@@ -209,6 +209,9 @@ def main() -> None:
 
     run_args = copy.deepcopy(args)
     run_args.downscale = 1.0
+    run_args.no_borders = False
+    run_args.no_annos = False
+    run_args.no_scribbles = False
 
     summaries: dict[str, list] = {}
     for image_path, mask_path in pairs:

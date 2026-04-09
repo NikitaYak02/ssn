@@ -19,6 +19,7 @@ except Exception:  # на старых/нестандартных сборках
         pass
 
 ArrayLike = Union[np.ndarray, Sequence[Sequence[float]]]
+SUPERPIXEL_BORDER_ALPHA = 0.4
 
 # ---------- утилиты ----------
 
@@ -91,6 +92,8 @@ def debug_visualize_candidates(
 
     overlay = base.copy()
     vis = base.copy()
+    border_items: List[Tuple[List[np.ndarray], Tuple[int, int, int]]] = []
+    label_items: List[Tuple[str, Tuple[int, int]]] = []
 
     used = set()
     for idx in candidate_indices:
@@ -103,7 +106,7 @@ def debug_visualize_candidates(
             continue
         color = random_color(idx)
         cv2.fillPoly(overlay, contours, color)
-        cv2.polylines(overlay, contours, isClosed=True, color=(0, 0, 0), thickness=1)
+        border_items.append((contours, (0, 0, 0)))
 
         if draw_labels:
             if superpixels is not None and 0 <= idx < len(superpixels) and hasattr(superpixels[idx], "centroid_xy"):
@@ -112,8 +115,7 @@ def debug_visualize_candidates(
                 c = poly.centroid
                 cx01, cy01 = float(c.x), float(c.y)
             cx, cy = int(cx01 * W), int(cy01 * H)
-            cv2.putText(vis, str(idx), (cx, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3, cv2.LINE_AA)
-            cv2.putText(vis, str(idx), (cx, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+            label_items.append((str(idx), (cx, cy)))
 
     # AABB fallback — оранжевый
     if aabb_extra_indices:
@@ -125,10 +127,18 @@ def debug_visualize_candidates(
             if not contours:
                 continue
             cv2.fillPoly(overlay, contours, (0, 165, 255))
-            cv2.polylines(overlay, contours, isClosed=True, color=(40, 40, 40), thickness=1)
+            border_items.append((contours, (40, 40, 40)))
 
     # альфа-слияние
     vis = cv2.addWeighted(overlay, alpha_fill, vis, 1 - alpha_fill, 0.0)
+    border_overlay = vis.copy()
+    for contours, border_color in border_items:
+        cv2.polylines(border_overlay, contours, isClosed=True, color=border_color, thickness=1)
+    vis = cv2.addWeighted(border_overlay, SUPERPIXEL_BORDER_ALPHA, vis, 1 - SUPERPIXEL_BORDER_ALPHA, 0.0)
+
+    for label, origin in label_items:
+        cv2.putText(vis, label, origin, cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3, cv2.LINE_AA)
+        cv2.putText(vis, label, origin, cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
 
     # штрих — красным
     if isinstance(scribble_points01, np.ndarray) and scribble_points01.size >= 4:

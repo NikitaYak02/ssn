@@ -23,3 +23,9 @@ numba>=0.57.0,<0.60.0
 
 # Data Visualization
 matplotlib>=3.7.0,<3.10.0
+
+# Augmentation
+albumentations>=2.0.0,<3.0.0
+
+# Hyperparameter Optimization
+optuna>=4.0.0,<5.0.0

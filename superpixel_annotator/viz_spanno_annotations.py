@@ -70,6 +70,7 @@ CLASS_INFO = [
     ("mrc", "#00008b"),
     ("au", "#8b008b"),
 ]
+SUPERPIXEL_BORDER_RGBA = (255, 255, 255, int(round(255 * 0.4)))
 
 
 def hex_to_rgb(hex_color: str) -> Tuple[int, int, int]:
@@ -280,7 +281,7 @@ def main():
 
         d.polygon(poly, fill=fill)
         if args.draw_borders:
-            d.line(poly + [poly[0]], fill=(255, 255, 255, 255), width=1)
+            d.line(poly + [poly[0]], fill=SUPERPIXEL_BORDER_RGBA, width=1)
 
     out = Image.alpha_composite(bg, overlay).convert("RGB")
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)

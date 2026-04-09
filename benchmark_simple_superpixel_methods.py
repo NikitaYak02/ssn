@@ -25,6 +25,7 @@ import torch
 
 from evaluate_superpixel_postprocessing import (
     build_hrnet_model,
+    build_legacy_strategy,
     compute_confusion,
     compute_superpixels,
     discover_image_pairs,
@@ -40,20 +41,23 @@ from evaluate_superpixel_postprocessing import (
     resolve_device,
     resolved_noise_std,
     run_model_logits,
-    superpixel_postprocess,
+    superpixel_postprocess_strategy,
+)
+from superpixel_refinement_strategies import (
+    SuperpixelRefinementStrategy,
+    generate_novel_refinement_strategies,
 )
 
 
-METHODS: list[tuple[str, str]] = [
-    ("baseline", "Pixel argmax without superpixels"),
+LEGACY_METHODS: list[tuple[str, str]] = [
     ("mean_proba", "Average probabilities per superpixel"),
     ("confidence_gated_mean_proba", "Apply superpixel relabeling only for confident regions"),
     ("low_confidence_mean_proba", "Only overwrite low-confidence pixels"),
     ("prior_corrected_mean_proba", "Average probabilities with image-level prior correction"),
     ("small_region_cleanup", "Merge tiny superpixel islands into dominant neighbors"),
     ("hybrid_conservative", "Low-confidence overwrite plus conservative island cleanup"),
+    ("majority_argmax", "Majority vote over pixel argmax labels"),
 ]
-
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -83,6 +87,18 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=5,
         help="How many image/mask pairs to evaluate from the start of the test set.",
+    )
+    parser.add_argument(
+        "--suite",
+        default="simple",
+        choices=["simple", "novel100", "all"],
+        help="Which refinement suite to benchmark.",
+    )
+    parser.add_argument(
+        "--strategy-limit",
+        type=int,
+        default=100,
+        help="How many generated novel strategies to include when suite is novel100/all.",
     )
     parser.add_argument(
         "--noise-std",
@@ -162,22 +178,39 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def build_method_entries(
+    args: argparse.Namespace,
+) -> list[tuple[str, str, SuperpixelRefinementStrategy | None]]:
+    entries: list[tuple[str, str, SuperpixelRefinementStrategy | None]] = [
+        ("baseline", "Pixel argmax without superpixels", None)
+    ]
+    if args.suite in {"simple", "all"}:
+        for method_name, description in LEGACY_METHODS:
+            strategy = build_legacy_strategy(
+                method_name,
+                confidence_threshold=args.confidence_threshold,
+                prior_power=args.prior_power,
+                small_component_superpixels=args.small_component_superpixels,
+                hybrid_neighbor_ratio=args.hybrid_neighbor_ratio,
+            )
+            entries.append((method_name, description, strategy))
+    if args.suite in {"novel100", "all"}:
+        for strategy in generate_novel_refinement_strategies(limit=args.strategy_limit):
+            entries.append((strategy.strategy_id, strategy.description, strategy))
+    return entries
+
+
 def method_prediction(
-    method: str,
+    strategy: SuperpixelRefinementStrategy | None,
     logits_np: np.ndarray,
     superpixels: np.ndarray,
-    args: argparse.Namespace,
 ) -> np.ndarray:
-    if method == "baseline":
+    if strategy is None:
         return logits_np.argmax(axis=0).astype(np.int32)
-    return superpixel_postprocess(
+    return superpixel_postprocess_strategy(
         logits_np=logits_np,
         superpixels=superpixels,
-        vote_mode=method,
-        confidence_threshold=args.confidence_threshold,
-        prior_power=args.prior_power,
-        small_component_superpixels=args.small_component_superpixels,
-        hybrid_neighbor_ratio=args.hybrid_neighbor_ratio,
+        strategy=strategy,
     )
 
 
@@ -216,9 +249,11 @@ def main() -> None:
         mask_codes_seen=mask_codes_seen,
     )
 
+    method_entries = build_method_entries(args)
+
     agg_confusions = {
         method: np.zeros((len(class_infos), len(class_infos)), dtype=np.int64)
-        for method, _ in METHODS
+        for method, _, _ in method_entries
     }
 
     rows: list[dict[str, object]] = []
@@ -251,8 +286,8 @@ def main() -> None:
         )
 
         image_metrics: dict[str, dict[str, float]] = {}
-        for method, description in METHODS:
-            pred_idx = method_prediction(method, logits_np, superpixels, args)
+        for method, description, strategy in method_entries:
+            pred_idx = method_prediction(strategy, logits_np, superpixels)
             confusion = compute_confusion(
                 gt_idx, pred_idx, len(class_infos), valid_mask
             )
@@ -267,6 +302,7 @@ def main() -> None:
                     "image": image_path.name,
                     "method": method,
                     "description": description,
+                    "family": ("baseline" if strategy is None else strategy.family),
                     "miou": metrics["miou"],
                     "pixel_accuracy": metrics["pixel_accuracy"],
                     "valid_pixels": int(valid_mask.sum()),
@@ -293,6 +329,7 @@ def main() -> None:
                 "image",
                 "method",
                 "description",
+                "family",
                 "miou",
                 "pixel_accuracy",
                 "valid_pixels",
@@ -304,13 +341,26 @@ def main() -> None:
 
     summary_methods: dict[str, dict[str, object]] = {}
     baseline_metrics = metrics_from_confusion(agg_confusions["baseline"], class_infos)
+    mean_proba_key = "mean_proba" if "mean_proba" in agg_confusions else "baseline"
     mean_proba_metrics = metrics_from_confusion(
-        agg_confusions["mean_proba"], class_infos
+        agg_confusions[mean_proba_key], class_infos
     )
-    for method, description in METHODS:
+    strategy_by_method = {method: strategy for method, _, strategy in method_entries}
+    description_by_method = {method: description for method, description, _ in method_entries}
+    for method, _, _ in method_entries:
         metrics = metrics_from_confusion(agg_confusions[method], class_infos)
         summary_methods[method] = {
-            "description": description,
+            "description": description_by_method[method],
+            "family": (
+                "baseline"
+                if strategy_by_method[method] is None
+                else strategy_by_method[method].family
+            ),
+            "strategy": (
+                None
+                if strategy_by_method[method] is None
+                else strategy_by_method[method].to_dict()
+            ),
             "miou": metrics["miou"],
             "pixel_accuracy": metrics["pixel_accuracy"],
             "delta_miou_vs_baseline": metrics["miou"] - baseline_metrics["miou"],
@@ -341,6 +391,8 @@ def main() -> None:
             for idx, info in enumerate(class_infos)
         ],
         "settings": {
+            "suite": args.suite,
+            "strategy_limit": int(args.strategy_limit),
             "sp_method": args.sp_method,
             "confidence_threshold": args.confidence_threshold,
             "prior_power": args.prior_power,
@@ -357,7 +409,7 @@ def main() -> None:
 
     print()
     print("Aggregated over", len(pairs), "images:")
-    for method, _ in METHODS:
+    for method, _, _ in method_entries:
         method_summary = summary_methods[method]
         print(
             f"{method:30s} "

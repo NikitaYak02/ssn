@@ -48,6 +48,55 @@ def test_small_or_thin_regions_merge_into_neighbors_for_ssn_cleanup():
     assert np.all((line == out[3:20, 11]) | (line == out[3:20, 13]))
 
 
+def test_labels_to_polygons_preserves_holes():
+    labels = np.zeros((10, 10), dtype=np.int32)
+    labels[1:9, 1:9] = 1
+    labels[4:6, 4:6] = 0
+
+    polys = structs.labels_to_polygons(
+        labels,
+        bbox01=(0.0, 0.0, 1.0, 1.0),
+        out_h=10,
+        out_w=10,
+        filter_labels=[1],
+    )
+
+    poly = polys[1]
+    assert poly.area > 0.0
+    assert len(poly.interiors) == 1
+
+
+def test_superpixel_and_annotation_roundtrip_holes():
+    hole = np.array(
+        [[0.4, 0.4], [0.6, 0.4], [0.6, 0.6], [0.4, 0.6]],
+        dtype=np.float32,
+    )
+    sp = structs.SuperPixel(
+        id=1,
+        method="TEST",
+        border=np.array([[0.1, 0.1], [0.9, 0.1], [0.9, 0.9], [0.1, 0.9]], dtype=np.float32),
+        parents=[],
+        props=np.zeros(6, dtype=np.float32),
+        holes=[hole],
+    )
+    anno = structs.AnnotationInstance(
+        id=2,
+        code=1,
+        border=sp.border.copy(),
+        parent_superpixel=sp.id,
+        holes=[hole.copy()],
+        parent_scribble=[10],
+        parent_intersect=True,
+    )
+
+    sp_loaded = structs.SuperPixel.from_dict(sp.dict_to_save())
+    anno_loaded = structs.AnnotationInstance.from_dict(anno.dict_to_save())
+
+    assert sp_loaded.holes is not None and len(sp_loaded.holes) == 1
+    assert anno_loaded.holes is not None and len(anno_loaded.holes) == 1
+    assert len(sp_loaded.poly.interiors) == 1
+
+
 def test_ssn_method_enables_embedding_defaults_automatically():
     image = Image.fromarray(np.zeros((16, 16, 3), dtype=np.uint8), mode="RGB")
     algo = structs.SuperPixelAnnotationAlgo(

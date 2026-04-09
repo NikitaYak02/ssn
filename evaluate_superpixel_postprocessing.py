@@ -37,6 +37,12 @@ from PIL import Image
 from scipy.ndimage import label as cc_label
 from skimage.segmentation import felzenszwalb, slic
 
+from superpixel_refinement_strategies import (
+    SuperpixelRefinementStrategy,
+    build_legacy_strategy,
+    named_strategy_catalog,
+)
+
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
 
@@ -125,6 +131,19 @@ def parse_args() -> argparse.Namespace:
             "hybrid_conservative",
         ],
         help="How to aggregate predictions inside a superpixel.",
+    )
+    parser.add_argument(
+        "--strategy-id",
+        default=None,
+        help=(
+            "Optional named refinement strategy. Supports legacy aliases and "
+            "the generated novel_XX_YY candidate pool."
+        ),
+    )
+    parser.add_argument(
+        "--list-strategies",
+        action="store_true",
+        help="Print available strategy ids and exit.",
     )
     parser.add_argument(
         "--confidence-threshold",
@@ -676,6 +695,90 @@ def compute_superpixel_mean_probs(
     return mean_probs.astype(np.float32), counts
 
 
+def compute_superpixel_weighted_probs(
+    probs: np.ndarray,
+    flat_sp: np.ndarray,
+    num_sp: int,
+    weights: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    flat_weights = np.asarray(weights, dtype=np.float32).reshape(-1)
+    flat_weights = np.maximum(flat_weights, 1e-6)
+    counts = np.bincount(
+        flat_sp,
+        weights=flat_weights,
+        minlength=num_sp,
+    ).astype(np.float32)
+    sums = np.stack(
+        [
+            np.bincount(
+                flat_sp,
+                weights=probs[c].reshape(-1) * flat_weights,
+                minlength=num_sp,
+            )
+            for c in range(probs.shape[0])
+        ],
+        axis=0,
+    )
+    mean_probs = sums / np.maximum(counts, 1e-6)[None, :]
+    return mean_probs.astype(np.float32), counts
+
+
+def compute_superpixel_mean_logits(
+    logits_np: np.ndarray,
+    flat_sp: np.ndarray,
+    num_sp: int,
+) -> np.ndarray:
+    channels = logits_np.shape[0]
+    sums = np.stack(
+        [
+            np.bincount(
+                flat_sp,
+                weights=logits_np[c].reshape(-1),
+                minlength=num_sp,
+            )
+            for c in range(channels)
+        ],
+        axis=0,
+    ).astype(np.float32)
+    counts = np.bincount(flat_sp, minlength=num_sp).astype(np.float32)
+    return sums / np.maximum(counts, 1.0)[None, :]
+
+
+def apply_temperature_to_probs(
+    probs: np.ndarray,
+    temperature: float,
+) -> np.ndarray:
+    if abs(float(temperature) - 1.0) < 1e-6:
+        return probs.astype(np.float32, copy=False)
+    adjusted = np.power(np.maximum(probs, 1e-8), 1.0 / float(temperature))
+    adjusted /= np.maximum(adjusted.sum(axis=0, keepdims=True), 1e-8)
+    return adjusted.astype(np.float32)
+
+
+def normalize_superpixel_scores(scores: np.ndarray) -> np.ndarray:
+    clipped = np.maximum(scores.astype(np.float32, copy=False), 1e-8)
+    denom = np.maximum(clipped.sum(axis=0, keepdims=True), 1e-8)
+    return (clipped / denom).astype(np.float32)
+
+
+def compute_pixel_confidence_features(
+    flat_probs: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    pixel_conf = flat_probs.max(axis=0).astype(np.float32)
+    if flat_probs.shape[0] > 1:
+        top2 = np.partition(flat_probs, kth=flat_probs.shape[0] - 2, axis=0)[-2:]
+        pixel_margin = (top2[-1] - top2[-2]).astype(np.float32)
+    else:
+        pixel_margin = pixel_conf.copy()
+    entropy = -np.sum(
+        flat_probs * np.log(np.maximum(flat_probs, 1e-8)),
+        axis=0,
+    )
+    entropy /= max(np.log(max(flat_probs.shape[0], 2)), 1e-8)
+    entropy = entropy.astype(np.float32)
+    return pixel_conf, pixel_margin, entropy
+
+
 def compute_superpixel_majority_labels(
     flat_labels: np.ndarray,
     flat_sp: np.ndarray,
@@ -707,6 +810,31 @@ def build_superpixel_adjacency(superpixels: np.ndarray) -> list[dict[int, int]]:
     add_edges(superpixels[:, :-1], superpixels[:, 1:])
     add_edges(superpixels[:-1, :], superpixels[1:, :])
     return adjacency
+
+
+def smooth_superpixel_scores(
+    scores: np.ndarray,
+    adjacency: list[dict[int, int]],
+    steps: int,
+    alpha: float,
+) -> np.ndarray:
+    if steps <= 0 or alpha <= 0.0:
+        return normalize_superpixel_scores(scores)
+
+    current = normalize_superpixel_scores(scores)
+    for _ in range(int(steps)):
+        smoothed = (1.0 - float(alpha)) * current
+        for node, neighbors in enumerate(adjacency):
+            if not neighbors:
+                continue
+            neigh_ids = np.fromiter(neighbors.keys(), dtype=np.int32)
+            neigh_weights = np.fromiter(neighbors.values(), dtype=np.float32)
+            neigh_weights /= np.maximum(neigh_weights.sum(), 1.0)
+            smoothed[:, node] += float(alpha) * (
+                current[:, neigh_ids] * neigh_weights[None, :]
+            ).sum(axis=1)
+        current = normalize_superpixel_scores(smoothed)
+    return current
 
 
 def cleanup_small_superpixel_components(
@@ -840,14 +968,152 @@ def cleanup_small_superpixel_components_conservative(
     return cleaned
 
 
-def superpixel_postprocess(
+def resolve_refinement_strategy(
+    *,
+    vote_mode: str,
+    strategy_id: str | None,
+    confidence_threshold: float,
+    prior_power: float,
+    small_component_superpixels: int,
+    hybrid_neighbor_ratio: float,
+) -> SuperpixelRefinementStrategy:
+    if strategy_id:
+        catalog = named_strategy_catalog(
+            confidence_threshold=confidence_threshold,
+            prior_power=prior_power,
+            small_component_superpixels=small_component_superpixels,
+            hybrid_neighbor_ratio=hybrid_neighbor_ratio,
+            include_legacy=True,
+            novel_limit=100,
+        )
+        if strategy_id in catalog:
+            return catalog[strategy_id]
+        if strategy_id in {
+            "mean_proba",
+            "majority_argmax",
+            "confidence_gated_mean_proba",
+            "low_confidence_mean_proba",
+            "prior_corrected_mean_proba",
+            "small_region_cleanup",
+            "hybrid_conservative",
+        }:
+            return build_legacy_strategy(
+                strategy_id,
+                confidence_threshold=confidence_threshold,
+                prior_power=prior_power,
+                small_component_superpixels=small_component_superpixels,
+                hybrid_neighbor_ratio=hybrid_neighbor_ratio,
+            )
+        raise KeyError(f"Unknown strategy-id: {strategy_id}")
+    return build_legacy_strategy(
+        vote_mode,
+        confidence_threshold=confidence_threshold,
+        prior_power=prior_power,
+        small_component_superpixels=small_component_superpixels,
+        hybrid_neighbor_ratio=hybrid_neighbor_ratio,
+    )
+
+
+def compute_superpixel_scores(
+    *,
+    logits_np: np.ndarray,
+    flat_sp: np.ndarray,
+    num_sp: int,
+    flat_probs: np.ndarray,
+    pixel_labels: np.ndarray,
+    pixel_conf: np.ndarray,
+    pixel_margin: np.ndarray,
+    pixel_entropy: np.ndarray,
+    strategy: SuperpixelRefinementStrategy,
+) -> np.ndarray:
+    if strategy.aggregate_mode == "majority_argmax":
+        votes = np.bincount(
+            flat_sp * logits_np.shape[0] + pixel_labels.astype(np.int32),
+            minlength=num_sp * logits_np.shape[0],
+        ).reshape(num_sp, logits_np.shape[0]).astype(np.float32)
+        return normalize_superpixel_scores(votes.T)
+
+    if strategy.aggregate_mode == "logit_mean":
+        mean_logits = compute_superpixel_mean_logits(logits_np, flat_sp, num_sp)
+        mean_logits_t = torch.from_numpy(mean_logits / float(strategy.temperature))
+        scores = torch.softmax(mean_logits_t, dim=0).numpy().astype(np.float32)
+    else:
+        probs_for_aggregation = apply_temperature_to_probs(
+            flat_probs,
+            float(strategy.temperature),
+        )
+        if strategy.aggregate_mode == "mean_proba":
+            scores, _ = compute_superpixel_mean_probs(
+                probs_for_aggregation.reshape(logits_np.shape),
+                flat_sp,
+                num_sp,
+            )
+        else:
+            if strategy.aggregate_mode == "confidence_weighted_mean":
+                weights = np.power(np.maximum(pixel_conf, 1e-6), float(strategy.weight_power))
+            elif strategy.aggregate_mode == "margin_weighted_mean":
+                weights = np.power(np.maximum(pixel_margin, 1e-6), float(strategy.weight_power))
+            elif strategy.aggregate_mode == "entropy_weighted_mean":
+                weights = np.power(
+                    np.maximum(1.0 - pixel_entropy, 1e-6),
+                    float(strategy.weight_power),
+                )
+            else:  # pragma: no cover - validated by strategy registry
+                raise ValueError(f"Unknown aggregate mode: {strategy.aggregate_mode}")
+            scores, _ = compute_superpixel_weighted_probs(
+                probs_for_aggregation.reshape(logits_np.shape),
+                flat_sp,
+                num_sp,
+                weights,
+            )
+
+    if float(strategy.prior_power) > 0.0:
+        priors = np.maximum(flat_probs.mean(axis=1), 1e-6).astype(np.float32)
+        scores = scores / np.power(priors[:, None], float(strategy.prior_power))
+    return normalize_superpixel_scores(scores)
+
+
+def apply_overwrite_policy(
+    *,
+    strategy: SuperpixelRefinementStrategy,
+    pixel_labels: np.ndarray,
+    pixel_conf: np.ndarray,
+    flat_sp: np.ndarray,
+    sp_labels: np.ndarray,
+    sp_conf: np.ndarray,
+    baseline_sp_labels: np.ndarray,
+) -> np.ndarray:
+    sp_flat_labels = sp_labels[flat_sp]
+    if strategy.overwrite_policy == "all":
+        return sp_flat_labels.astype(np.int32)
+
+    out_flat = pixel_labels.copy()
+    if strategy.overwrite_policy == "low_pixel_conf":
+        mask = pixel_conf < float(strategy.pixel_confidence_threshold)
+    elif strategy.overwrite_policy == "disagree_low_pixel_conf":
+        mask = (
+            (pixel_labels != sp_flat_labels)
+            & (pixel_conf < float(strategy.pixel_confidence_threshold))
+        )
+    elif strategy.overwrite_policy == "high_sp_conf":
+        mask = sp_conf[flat_sp] >= float(strategy.superpixel_confidence_threshold)
+    elif strategy.overwrite_policy == "changed_high_sp_conf":
+        mask = (
+            (baseline_sp_labels[flat_sp] != sp_flat_labels)
+            & (sp_conf[flat_sp] >= float(strategy.superpixel_confidence_threshold))
+        )
+    else:  # pragma: no cover - validated by strategy registry
+        raise ValueError(f"Unknown overwrite policy: {strategy.overwrite_policy}")
+
+    out_flat[mask] = sp_flat_labels[mask]
+    return out_flat.astype(np.int32)
+
+
+def superpixel_postprocess_strategy(
+    *,
     logits_np: np.ndarray,
     superpixels: np.ndarray,
-    vote_mode: str,
-    confidence_threshold: float = 0.75,
-    prior_power: float = 0.5,
-    small_component_superpixels: int = 3,
-    hybrid_neighbor_ratio: float = 0.6,
+    strategy: SuperpixelRefinementStrategy,
 ) -> np.ndarray:
     channels, height, width = logits_np.shape
     if superpixels.shape != (height, width):
@@ -861,79 +1127,105 @@ def superpixel_postprocess(
     probs = torch.softmax(torch.from_numpy(logits_np), dim=0).numpy().astype(np.float32)
     flat_probs = probs.reshape(channels, -1)
     pixel_labels = flat_probs.argmax(axis=0).astype(np.int32)
-    pixel_conf = flat_probs.max(axis=0).astype(np.float32)
-    mean_probs, counts = compute_superpixel_mean_probs(probs, flat_sp, num_sp)
+    pixel_conf, pixel_margin, pixel_entropy = compute_pixel_confidence_features(flat_probs)
 
-    if vote_mode == "mean_proba":
-        sp_labels = mean_probs.argmax(axis=0).astype(np.int32)
-    elif vote_mode == "majority_argmax":
-        votes = np.bincount(
-            flat_sp * channels + pixel_labels,
-            minlength=num_sp * channels,
-        ).reshape(num_sp, channels)
-        sp_labels = votes.argmax(axis=1).astype(np.int32)
-    elif vote_mode == "confidence_gated_mean_proba":
-        sp_labels = mean_probs.argmax(axis=0).astype(np.int32)
-        sp_conf = mean_probs.max(axis=0)
-        out_flat = pixel_labels.copy()
-        confident_pixels = sp_conf[flat_sp] >= float(confidence_threshold)
-        out_flat[confident_pixels] = sp_labels[flat_sp[confident_pixels]]
-        return out_flat.reshape(height, width)
-    elif vote_mode == "low_confidence_mean_proba":
-        sp_labels = mean_probs.argmax(axis=0).astype(np.int32)
-        out_flat = pixel_labels.copy()
-        low_conf_pixels = pixel_conf < float(confidence_threshold)
-        out_flat[low_conf_pixels] = sp_labels[flat_sp[low_conf_pixels]]
-        return out_flat.reshape(height, width)
-    elif vote_mode == "prior_corrected_mean_proba":
-        priors = flat_probs.mean(axis=1)
-        priors = np.maximum(priors, 1e-6).astype(np.float32)
-        adjusted = mean_probs / np.power(priors[:, None], float(prior_power))
-        sp_labels = adjusted.argmax(axis=0).astype(np.int32)
-    elif vote_mode == "small_region_cleanup":
-        sp_labels = mean_probs.argmax(axis=0).astype(np.int32)
+    scores = compute_superpixel_scores(
+        logits_np=logits_np,
+        flat_sp=flat_sp,
+        num_sp=num_sp,
+        flat_probs=flat_probs,
+        pixel_labels=pixel_labels,
+        pixel_conf=pixel_conf,
+        pixel_margin=pixel_margin,
+        pixel_entropy=pixel_entropy,
+        strategy=strategy,
+    )
+    if int(strategy.graph_steps) > 0 and float(strategy.graph_alpha) > 0.0:
         adjacency = build_superpixel_adjacency(superpixels)
-        sp_labels = cleanup_small_superpixel_components(
-            sp_labels,
+        scores = smooth_superpixel_scores(
+            scores,
             adjacency,
-            max_component_size=int(small_component_superpixels),
+            steps=int(strategy.graph_steps),
+            alpha=float(strategy.graph_alpha),
         )
-    elif vote_mode == "hybrid_conservative":
-        sp_labels = mean_probs.argmax(axis=0).astype(np.int32)
-        out_flat = pixel_labels.copy()
-        low_conf_pixels = pixel_conf < float(confidence_threshold)
-        out_flat[low_conf_pixels] = sp_labels[flat_sp[low_conf_pixels]]
+    else:
+        adjacency = None
 
-        baseline_sp_labels = compute_superpixel_majority_labels(
-            pixel_labels,
-            flat_sp,
-            num_sp,
-            channels,
-        )
-        stage1_sp_labels = compute_superpixel_majority_labels(
-            out_flat,
-            flat_sp,
-            num_sp,
-            channels,
-        )
-        sp_confidence = mean_probs.max(axis=0).astype(np.float32)
-        eligible_mask = stage1_sp_labels != baseline_sp_labels
+    sp_labels = scores.argmax(axis=0).astype(np.int32)
+    sp_conf = scores.max(axis=0).astype(np.float32)
+    baseline_sp_labels = compute_superpixel_majority_labels(
+        pixel_labels,
+        flat_sp,
+        num_sp,
+        channels,
+    )
+    out_flat = apply_overwrite_policy(
+        strategy=strategy,
+        pixel_labels=pixel_labels,
+        pixel_conf=pixel_conf,
+        flat_sp=flat_sp,
+        sp_labels=sp_labels,
+        sp_conf=sp_conf,
+        baseline_sp_labels=baseline_sp_labels,
+    )
+
+    if strategy.cleanup_mode == "none":
+        return out_flat.reshape(height, width)
+
+    if adjacency is None:
         adjacency = build_superpixel_adjacency(superpixels)
+    stage1_sp_labels = compute_superpixel_majority_labels(
+        out_flat,
+        flat_sp,
+        num_sp,
+        channels,
+    )
+    if strategy.cleanup_mode == "simple":
+        stage2_sp_labels = cleanup_small_superpixel_components(
+            stage1_sp_labels,
+            adjacency,
+            max_component_size=int(strategy.small_component_superpixels),
+        )
+    elif strategy.cleanup_mode == "conservative":
+        counts = np.bincount(flat_sp, minlength=num_sp).astype(np.float32)
+        eligible_mask = stage1_sp_labels != baseline_sp_labels
         stage2_sp_labels = cleanup_small_superpixel_components_conservative(
             stage1_sp_labels,
             adjacency,
-            max_component_size=int(small_component_superpixels),
-            sp_confidence=sp_confidence,
+            max_component_size=int(strategy.small_component_superpixels),
+            sp_confidence=sp_conf,
             counts=counts,
-            confidence_threshold=float(confidence_threshold),
-            neighbor_ratio_threshold=float(hybrid_neighbor_ratio),
+            confidence_threshold=float(strategy.superpixel_confidence_threshold),
+            neighbor_ratio_threshold=float(strategy.neighbor_ratio_threshold),
             eligible_mask=eligible_mask,
         )
-        return stage2_sp_labels[flat_sp].reshape(height, width)
-    else:  # pragma: no cover - argparse already protects this
-        raise ValueError(f"Unknown vote-mode: {vote_mode}")
+    else:  # pragma: no cover - validated by strategy registry
+        raise ValueError(f"Unknown cleanup mode: {strategy.cleanup_mode}")
+    return stage2_sp_labels[flat_sp].reshape(height, width)
 
-    return sp_labels[flat_sp].reshape(height, width)
+
+def superpixel_postprocess(
+    logits_np: np.ndarray,
+    superpixels: np.ndarray,
+    vote_mode: str,
+    confidence_threshold: float = 0.75,
+    prior_power: float = 0.5,
+    small_component_superpixels: int = 3,
+    hybrid_neighbor_ratio: float = 0.6,
+) -> np.ndarray:
+    strategy = resolve_refinement_strategy(
+        vote_mode=vote_mode,
+        strategy_id=None,
+        confidence_threshold=confidence_threshold,
+        prior_power=prior_power,
+        small_component_superpixels=small_component_superpixels,
+        hybrid_neighbor_ratio=hybrid_neighbor_ratio,
+    )
+    return superpixel_postprocess_strategy(
+        logits_np=logits_np,
+        superpixels=superpixels,
+        strategy=strategy,
+    )
 
 
 def perturb_checkpoint(
@@ -1067,6 +1359,7 @@ def save_summary_json(
     image_count: int,
     device: str,
     output_dir: Path,
+    strategy: SuperpixelRefinementStrategy,
 ) -> None:
     before = metrics_from_confusion(before_conf, class_infos)
     after = metrics_from_confusion(after_conf, class_infos)
@@ -1079,6 +1372,8 @@ def save_summary_json(
         "postprocessing": {
             "sp_method": args.sp_method,
             "vote_mode": args.vote_mode,
+            "strategy_id": strategy.strategy_id,
+            "strategy": strategy.to_dict(),
             "confidence_threshold": args.confidence_threshold,
             "prior_power": args.prior_power,
             "small_component_superpixels": args.small_component_superpixels,
@@ -1110,6 +1405,27 @@ def save_summary_json(
 
 def main() -> None:
     args = parse_args()
+    strategy = resolve_refinement_strategy(
+        vote_mode=args.vote_mode,
+        strategy_id=args.strategy_id,
+        confidence_threshold=args.confidence_threshold,
+        prior_power=args.prior_power,
+        small_component_superpixels=args.small_component_superpixels,
+        hybrid_neighbor_ratio=args.hybrid_neighbor_ratio,
+    )
+    if args.list_strategies:
+        catalog = named_strategy_catalog(
+            confidence_threshold=args.confidence_threshold,
+            prior_power=args.prior_power,
+            small_component_superpixels=args.small_component_superpixels,
+            hybrid_neighbor_ratio=args.hybrid_neighbor_ratio,
+            include_legacy=True,
+            novel_limit=100,
+        )
+        for strategy_name in sorted(catalog):
+            print(strategy_name)
+        return
+
     output_dir = Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1199,15 +1515,22 @@ def main() -> None:
                 felz_sigma=args.felz_sigma,
                 felz_min_size=args.felz_min_size,
             )
-            pred_post_idx = superpixel_postprocess(
-                logits_np=logits_np,
-                superpixels=superpixels,
-                vote_mode=args.vote_mode,
-                confidence_threshold=args.confidence_threshold,
-                prior_power=args.prior_power,
-                small_component_superpixels=args.small_component_superpixels,
-                hybrid_neighbor_ratio=args.hybrid_neighbor_ratio,
-            )
+            if args.strategy_id:
+                pred_post_idx = superpixel_postprocess_strategy(
+                    logits_np=logits_np,
+                    superpixels=superpixels,
+                    strategy=strategy,
+                )
+            else:
+                pred_post_idx = superpixel_postprocess(
+                    logits_np=logits_np,
+                    superpixels=superpixels,
+                    vote_mode=args.vote_mode,
+                    confidence_threshold=args.confidence_threshold,
+                    prior_power=args.prior_power,
+                    small_component_superpixels=args.small_component_superpixels,
+                    hybrid_neighbor_ratio=args.hybrid_neighbor_ratio,
+                )
 
             image_before_conf = compute_confusion(
                 gt_idx, pred_base_idx, len(class_infos), valid_mask
@@ -1278,6 +1601,7 @@ def main() -> None:
         image_count=len(pairs),
         device=device,
         output_dir=output_dir,
+        strategy=strategy,
     )
 
     before = metrics_from_confusion(before_conf, class_infos)

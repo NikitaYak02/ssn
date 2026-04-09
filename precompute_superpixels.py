@@ -33,6 +33,7 @@ sys.path.insert(0, str(_SCRIPT_DIR / "superpixel_annotator"))
 sys.path.insert(0, str(_SCRIPT_DIR))
 
 import structs  # noqa: E402
+from shapely.geometry import Polygon  # noqa: E402
 
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
@@ -54,36 +55,7 @@ def discover_images(img_dir: Path, recursive: bool = True) -> List[Path]:
 
 
 def build_sp_method(args: argparse.Namespace) -> structs.SuperPixelMethod:
-    method = args.method.lower()
-    if method == "slic":
-        return structs.SLICSuperpixel(
-            n_clusters=int(args.n_segments),
-            compactness=float(args.compactness),
-            sigma=float(args.sigma),
-        )
-    if method in ("felzenszwalb", "fwb"):
-        return structs.FelzenszwalbSuperpixel(
-            min_size=int(args.min_size),
-            sigma=float(args.f_sigma),
-            scale=float(args.scale),
-        )
-    if method in ("watershed", "ws"):
-        return structs.WatershedSuperpixel(
-            compactness=float(args.ws_compactness),
-            n_components=int(args.ws_components),
-        )
-    if method == "ssn":
-        if not args.ssn_weights:
-            raise ValueError("--ssn_weights is required for method=ssn")
-        return structs.SSNSuperpixel(
-            weight_path=str(args.ssn_weights),
-            nspix=int(args.ssn_nspix),
-            fdim=int(args.ssn_fdim),
-            niter=int(args.ssn_niter),
-            color_scale=float(args.ssn_color_scale),
-            pos_scale=float(args.ssn_pos_scale),
-        )
-    raise ValueError(f"Unknown method: {args.method!r}")
+    return structs.build_superpixel_method_from_args(args)
 
 
 def populate_full_image_superpixels(
@@ -119,16 +91,29 @@ def populate_full_image_superpixels(
         if lab_i <= 0:
             continue
         poly = polys.get(lab_i)
-        if poly is None or len(poly) < 3:
+        if poly is None:
+            continue
+        if isinstance(poly, Polygon):
+            border = np.asarray(poly.exterior.coords, dtype=np.float32)
+            holes = [
+                np.asarray(interior.coords, dtype=np.float32)
+                for interior in poly.interiors
+                if len(interior.coords) >= 3
+            ]
+        else:
+            border = np.asarray(poly, dtype=np.float32)
+            holes = []
+        if border.ndim != 2 or border.shape[0] < 3:
             continue
         props = np.concatenate([means[i], variances[i]]).astype(np.float32)
         algo.superpixels[sp_method].append(
             structs.SuperPixel(
                 id=int(algo._superpixel_ind[sp_method]),
                 method=sp_method.short_string(),
-                border=np.asarray(poly, dtype=np.float32),
+                border=border,
                 parents=[],
                 props=props,
+                holes=holes,
                 emb=None,
             )
         )
@@ -175,7 +160,11 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--img_dir", required=True, help="Папка с изображениями")
     ap.add_argument("--out_dir", required=True, help="Куда сохранять .spanno.json.gz")
     ap.add_argument("--method", default="slic",
-                    choices=["slic", "felzenszwalb", "fwb", "watershed", "ws", "ssn"])
+                    choices=structs.SUPPORTED_SUPERPIXEL_METHOD_CHOICES)
+    ap.add_argument("--method_config", default=None,
+                    help="JSON string or path to JSON config for neural methods.")
+    ap.add_argument("--weights", default=None,
+                    help="Checkpoint for neural methods (and optional alias for ssn).")
     ap.add_argument("--downscale", type=float, default=1.0,
                     help="downscale_coeff для SuperPixelAnnotationAlgo")
     ap.add_argument("--overwrite", action="store_true",

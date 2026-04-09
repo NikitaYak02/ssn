@@ -101,6 +101,7 @@ DEFAULT_CLASS_INFO = [
     ("mrc",       "#00008b"),
     ("au",        "#8b008b"),
 ]
+_SUPERPIXEL_BORDER_RGBA = (255, 255, 0, int(round(255 * 0.4)))
 
 
 def _hex_to_rgb(h: str) -> Tuple[int, int, int]:
@@ -1680,36 +1681,7 @@ def run_propagation(
 # ─────────────────────────────────────────────────────────────────────────────────
 
 def build_sp_method(args) -> "structs.SuperPixelMethod":
-    m = args.method.lower()
-    if m == "slic":
-        return structs.SLICSuperpixel(
-            n_clusters=int(args.n_segments),
-            compactness=float(args.compactness),
-            sigma=float(args.sigma),
-        )
-    if m in ("felzenszwalb", "fwb"):
-        return structs.FelzenszwalbSuperpixel(
-            min_size=int(args.min_size),
-            sigma=float(args.f_sigma),
-            scale=float(args.scale),
-        )
-    if m in ("watershed", "ws"):
-        return structs.WatershedSuperpixel(
-            compactness=float(args.ws_compactness),
-            n_components=int(args.ws_components),
-        )
-    if m == "ssn":
-        if not args.ssn_weights:
-            raise ValueError("--ssn_weights required for method=ssn")
-        return structs.SSNSuperpixel(
-            weight_path=args.ssn_weights,
-            nspix=int(args.ssn_nspix),
-            fdim=int(args.ssn_fdim),
-            niter=int(args.ssn_niter),
-            color_scale=float(args.ssn_color_scale),
-            pos_scale=float(args.ssn_pos_scale),
-        )
-    raise ValueError(f"Unknown method: {args.method!r}")
+    return structs.build_superpixel_method_from_args(args)
 
 
 def parse_region_selection_cycle(raw_value: str) -> List[str]:
@@ -1764,7 +1736,7 @@ def render_snapshot(
         for sp in algo.superpixels.get(sp_method, []):
             b = np.asarray(sp.border, np.float32)
             poly = [(float(b[i, 0] * W), float(b[i, 1] * H)) for i in range(len(b))]
-            draw.polygon(poly, outline=(255, 255, 0, 255))
+            draw.polygon(poly, outline=_SUPERPIXEL_BORDER_RGBA)
 
     composite = Image.alpha_composite(img.convert("RGBA"), overlay)
 
@@ -2009,11 +1981,64 @@ def run_single_image(
             per_class_ink[gt_id] += length
 
     metrics_history: List[StepMetrics] = []
+    dynamic_history: List[dict[str, object]] = []
 
     # ── CSV ─────────────────────────────────────────────────────────────────────
     csv_path = out_dir / "metrics.csv"
     csv_file = open(csv_path, "w", newline="", encoding="utf-8")
     csv_writer: Optional[csv.DictWriter] = None   # инициализируем на первой записи
+
+    dynamic_csv_path = out_dir / "dynamic_metrics.csv"
+    dynamic_csv_file = open(dynamic_csv_path, "w", newline="", encoding="utf-8")
+    dynamic_csv_writer: Optional[csv.DictWriter] = None
+
+    def write_dynamic_metrics(
+        step: int,
+        pred: np.ndarray,
+        n_scr: int,
+        total_ink_now: float,
+    ) -> None:
+        nonlocal dynamic_csv_writer
+
+        annotated_mask = (pred >= 0)
+        annotated_px = int(annotated_mask.sum())
+        correct_mask = annotated_mask & (pred == gt)
+        correctly_px = int(correct_mask.sum())
+        total_px = H * W
+        coverage = annotated_px / total_px
+        ann_prec = correctly_px / annotated_px if annotated_px > 0 else 0.0
+        dyn_miou, dyn_per_iou = compute_ious(pred, gt, num_classes)
+
+        row: dict[str, object] = {
+            "step": int(step),
+            "n_scribbles": int(n_scr),
+            "total_ink_px": round(float(total_ink_now), 2),
+            "annotated_px": annotated_px,
+            "correctly_annotated_px": correctly_px,
+            "total_px": total_px,
+            "coverage": round(float(coverage), 6),
+            "annotation_precision": round(float(ann_prec), 6),
+            "dynamic_miou": round(float(dyn_miou), 6) if not math.isnan(dyn_miou) else float("nan"),
+        }
+        for i, name in enumerate([c[0] for c in class_info]):
+            iou_v = dyn_per_iou[i] if i < len(dyn_per_iou) else float("nan")
+            row[f"dynamic_iou_{name}"] = round(float(iou_v), 6) if not math.isnan(iou_v) else float("nan")
+
+        dynamic_history.append(row)
+        if dynamic_csv_writer is None:
+            dynamic_csv_writer = csv.DictWriter(dynamic_csv_file, fieldnames=list(row.keys()))
+            dynamic_csv_writer.writeheader()
+        dynamic_csv_writer.writerow(row)
+        dynamic_csv_file.flush()
+
+        logger.info(
+            "dynamic step=%d scribbles=%d dyn_mIoU=%.4f cov=%.4f prec=%.4f",
+            step,
+            n_scr,
+            float(dyn_miou) if not math.isnan(dyn_miou) else 0.0,
+            coverage,
+            ann_prec,
+        )
 
     def checkpoint(step: int) -> StepMetrics:
         nonlocal csv_writer
@@ -2067,6 +2092,12 @@ def run_single_image(
 
     # ── Базовые метрики до новых штрихов ───────────────────────────────────────
     checkpoint(start_step)
+    write_dynamic_metrics(
+        step=start_step,
+        pred=pred_upd.pred_np,
+        n_scr=len(ink_list),
+        total_ink_now=total_ink,
+    )
     no_progress_steps = 0
 
     # ── Главный цикл штрихов ────────────────────────────────────────────────────
@@ -2142,6 +2173,12 @@ def run_single_image(
         cur_pred = pred_upd.pred_np
         cur_annotated_px = int((cur_pred >= 0).sum())
         cur_correct_px = int(((cur_pred >= 0) & (cur_pred == gt)).sum())
+        write_dynamic_metrics(
+            step=sid,
+            pred=cur_pred,
+            n_scr=len(ink_list),
+            total_ink_now=total_ink,
+        )
         made_progress = (
             cur_annotated_px > prev_annotated_px
             or cur_correct_px > prev_correct_px
@@ -2197,6 +2234,7 @@ def run_single_image(
     # --- График кривых обучения ---
     plot_metrics(metrics_history, class_info, out_dir / "learning_curves.png")
 
+    dynamic_csv_file.close()
     return metrics_history
 
 
@@ -2315,7 +2353,11 @@ def build_parser() -> argparse.ArgumentParser:
     # --- Метод суперпикселей ---
     grp_sp = ap.add_argument_group("Superpixel method")
     grp_sp.add_argument("--method", default="slic",
-                        choices=["slic", "felzenszwalb", "fwb", "watershed", "ws", "ssn"])
+                        choices=structs.SUPPORTED_SUPERPIXEL_METHOD_CHOICES)
+    grp_sp.add_argument("--method_config", default=None,
+                        help="JSON string or path to JSON config for neural methods.")
+    grp_sp.add_argument("--weights", default=None,
+                        help="Checkpoint for neural methods (and optional alias for ssn).")
     # SLIC
     grp_sp.add_argument("--n_segments", type=int, default=3000)
     grp_sp.add_argument("--compactness", type=float, default=20.0)

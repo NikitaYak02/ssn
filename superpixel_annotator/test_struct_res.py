@@ -58,6 +58,7 @@ CLASS_INFO = [
 ]
 
 GTID_TO_CODE = {gt_id: gt_id + 1 for gt_id in range(len(CLASS_INFO))}
+SUPERPIXEL_BORDER_RGBA = (255, 255, 0, int(round(255 * 0.4)))
 
 
 def hex_to_rgba(hex_color: str, alpha: int) -> Tuple[int, int, int, int]:
@@ -527,7 +528,7 @@ def render_snapshot(
                 border[:, 0] *= W
                 border[:, 1] *= H
                 poly = [(float(x), float(y)) for x, y in border]
-                draw.polygon(poly, outline=(255, 255, 0, 255))
+                draw.polygon(poly, outline=SUPERPIXEL_BORDER_RGBA)
 
     img_rgba = img.convert("RGBA")
     img_rgba = Image.alpha_composite(img_rgba, overlay)

@@ -77,21 +77,23 @@ def _build_scribble(sid, code, p0, p1):
     }
 
 
-def _build_superpixel(sp_id, border):
+def _build_superpixel(sp_id, border, holes=None):
     return {
         "id": sp_id,
         "method": "SLIC_TEST",
         "border": border,
+        "holes": list(holes or []),
         "parents": [],
         "props": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
     }
 
 
-def _build_annotation(anno_id, code, sp_id, border, scribble_ids, parent_intersect):
+def _build_annotation(anno_id, code, sp_id, border, scribble_ids, parent_intersect, holes=None):
     return {
         "id": anno_id,
         "code": code,
         "border": border,
+        "holes": list(holes or []),
         "parent_superpixel": sp_id,
         "parent_scribble": list(scribble_ids),
         "parent_intersect": bool(parent_intersect),
@@ -237,8 +239,150 @@ def test_render_panel_matches_snapshot_style_alpha_composite(tmp_path):
     )
 
     center_px = tuple(int(v) for v in panel[state.render_height // 2, state.render_width // 2])
-    expected_bgr = (145, 145, 255)
+    expected_bgr = (145, 216, 255)
     assert all(abs(got - exp) <= 1 for got, exp in zip(center_px, expected_bgr))
+
+
+def test_render_panel_highlight_uses_same_class_color_with_stronger_alpha(tmp_path):
+    run_dir = tmp_path / "run_highlight"
+    run_dir.mkdir()
+
+    sp1 = _build_superpixel(1, _rect(0.25, 0.25, 0.75, 0.75))
+    state1 = _state_payload(
+        step=1,
+        scribbles=[],
+        annotations=[_build_annotation(0, 13, 1, sp1["border"], [1], True)],
+        superpixels=[sp1],
+        width=20,
+        height=20,
+    )
+
+    _write_state(run_dir / "state_000001.json", state1)
+    state = replay.load_state(run_dir / "state_000001.json", max_side=20, method=None)
+    base = np.full((state.render_height, state.render_width, 3), 255, dtype=np.uint8)
+
+    panel = replay.render_panel(
+        state=state,
+        base_image=base,
+        annotations_by_sp={},
+        highlight_direct=[1],
+        highlight_prop=[],
+        scribbles=[],
+        class_info=replay._build_default_class_info(13),
+        show_borders=False,
+        highlight_alpha=replay._NEW_ANNOTATION_FILL_ALPHA,
+    )
+
+    center_px = tuple(int(v) for v in panel[state.render_height // 2, state.render_width // 2])
+    expected_bgr = (65, 160, 65)
+    assert all(abs(got - exp) <= 2 for got, exp in zip(center_px, expected_bgr))
+
+
+def test_render_panel_superpixel_border_uses_partial_alpha(tmp_path):
+    run_dir = tmp_path / "run_border_alpha"
+    run_dir.mkdir()
+
+    sp1 = _build_superpixel(1, _rect(0.25, 0.25, 0.75, 0.75))
+    state1 = _state_payload(
+        step=1,
+        scribbles=[],
+        annotations=[],
+        superpixels=[sp1],
+        width=20,
+        height=20,
+    )
+
+    _write_state(run_dir / "state_000001.json", state1)
+    state = replay.load_state(run_dir / "state_000001.json", max_side=20, method=None)
+    base = np.full((state.render_height, state.render_width, 3), 255, dtype=np.uint8)
+
+    panel = replay.render_panel(
+        state=state,
+        base_image=base,
+        annotations_by_sp={},
+        highlight_direct=[],
+        highlight_prop=[],
+        scribbles=[],
+        class_info=replay._build_default_class_info(1),
+        show_borders=True,
+    )
+
+    border_px = tuple(int(v) for v in panel[5, 10])
+    expected_bgr = (153, 255, 255)
+    assert all(abs(got - exp) <= 2 for got, exp in zip(border_px, expected_bgr))
+
+
+def test_load_state_preserves_superpixel_holes(tmp_path):
+    run_dir = tmp_path / "run_holes"
+    run_dir.mkdir()
+
+    hole = _rect(0.40, 0.40, 0.60, 0.60)
+    sp = _build_superpixel(1, _rect(0.20, 0.20, 0.80, 0.80), holes=[hole])
+    state = _state_payload(
+        step=1,
+        scribbles=[],
+        annotations=[],
+        superpixels=[sp],
+        width=20,
+        height=20,
+    )
+    _write_state(run_dir / "state_000001.json", state)
+
+    loaded = replay.load_state(run_dir / "state_000001.json", max_side=20, method=None)
+
+    outer_px, holes_px = loaded.superpixels_by_id[1]
+    assert outer_px.shape[0] >= 4
+    assert len(holes_px) == 1
+    assert holes_px[0].shape[0] >= 4
+
+
+def test_render_panel_keeps_hole_transparent_for_nested_superpixel(tmp_path):
+    run_dir = tmp_path / "run_nested"
+    run_dir.mkdir()
+
+    hole = _rect(0.40, 0.40, 0.60, 0.60)
+    outer = _build_superpixel(1, _rect(0.20, 0.20, 0.80, 0.80), holes=[hole])
+    inner = _build_superpixel(2, hole)
+    state_payload = _state_payload(
+        step=1,
+        scribbles=[],
+        annotations=[
+            _build_annotation(0, 1, 1, outer["border"], [1], True, holes=outer["holes"]),
+            _build_annotation(1, 2, 2, inner["border"], [1], True),
+        ],
+        superpixels=[outer, inner],
+        width=40,
+        height=40,
+    )
+    _write_state(run_dir / "state_000001.json", state_payload)
+    state = replay.load_state(run_dir / "state_000001.json", max_side=40, method=None)
+    base = np.full((state.render_height, state.render_width, 3), 255, dtype=np.uint8)
+
+    without_inner = replay.render_panel(
+        state=state,
+        base_image=base,
+        annotations_by_sp={1: state.annotations_by_sp[1]},
+        highlight_direct=[],
+        highlight_prop=[],
+        scribbles=[],
+        class_info=replay._build_default_class_info(2),
+        show_borders=False,
+    )
+    with_inner = replay.render_panel(
+        state=state,
+        base_image=base,
+        annotations_by_sp=state.annotations_by_sp,
+        highlight_direct=[],
+        highlight_prop=[],
+        scribbles=[],
+        class_info=replay._build_default_class_info(2),
+        show_borders=False,
+    )
+
+    center_y = state.render_height // 2
+    center_x = state.render_width // 2
+    assert tuple(int(v) for v in without_inner[center_y, center_x]) == (255, 255, 255)
+    assert tuple(int(v) for v in with_inner[center_y, center_x]) != (255, 255, 255)
 
 
 def test_open_video_writer_prefers_h264_family_and_falls_back(monkeypatch, tmp_path):

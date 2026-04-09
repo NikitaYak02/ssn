@@ -13,6 +13,7 @@ import json
 from shapely import LineString
 
 MAX_DOWNSCALE_COEFF = 10
+SUPERPIXEL_BORDER_RGBA = (255, 255, 0, int(round(255 * 0.4)))
 
 def get_downscaled_image(image: Image, max_size: int):
     """
@@ -612,10 +613,18 @@ class ScribbleApp:
                     proc_borders[:, 0] *= tgt_sh[0]
                     proc_borders[:, 1] *= tgt_sh[1]
                     polygon = [(x[0], x[1]) for x in proc_borders]
+                    hole_polygons = []
+                    for hole in superpixel.holes or []:
+                        proc_hole = copy.deepcopy(hole)
+                        proc_hole[:, 0] *= tgt_sh[0]
+                        proc_hole[:, 1] *= tgt_sh[1]
+                        hole_polygons.append([(x[0], x[1]) for x in proc_hole])
                     marker_name = get_key_by_value_markers(self.markers, superpixel.code)
                     color = str(self.markers[marker_name][1])
                     color = (int(color[1:3], base=16), int(color[3:5], base=16), int(color[5:7], base=16), 125)
                     draw.polygon(polygon, fill=color)
+                    for hole_polygon in hole_polygons:
+                        draw.polygon(hole_polygon, fill=(255, 255, 255, 0))
                 #self.canvas.create_polygon(*(proc_borders.reshape(-1)), fill="#00FF00", alpha=0.5, outline="red", width=2)
             #print(self.superpixel_anno_algo.superpixels)
             if not signal_from_paint and self.draw_borders_var.get():
@@ -625,7 +634,13 @@ class ScribbleApp:
                     proc_borders[:, 0] *= tgt_sh[0]
                     proc_borders[:, 1] *= tgt_sh[1]
                     polygon = [(x[0], x[1]) for x in proc_borders]
-                    draw.polygon(polygon, outline="yellow")
+                    draw.polygon(polygon, outline=SUPERPIXEL_BORDER_RGBA)
+                    for hole in superpixel.holes or []:
+                        proc_hole = copy.deepcopy(hole)
+                        proc_hole[:, 0] *= tgt_sh[0]
+                        proc_hole[:, 1] *= tgt_sh[1]
+                        hole_polygon = [(x[0], x[1]) for x in proc_hole]
+                        draw.polygon(hole_polygon, outline=SUPERPIXEL_BORDER_RGBA)
         overlay_rgb = self.overlay.convert("RGB")
         overlay_alpha = self.overlay.split()[-1]  # Alpha channel
         image = self.image.copy()

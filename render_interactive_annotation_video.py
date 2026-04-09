@@ -65,13 +65,15 @@ DEFAULT_CLASS_INFO = [
 ]
 
 _IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff")
-_DIRECT_BRG = (0, 170, 255)
-_PROP_BRG = (255, 255, 0)
 _BORDER_BGR = (80, 80, 80)
 _TEXT_MAIN_BGR = (245, 245, 245)
 _TEXT_SUB_BGR = (180, 180, 180)
 _BG_BGR = (22, 24, 28)
 _PANEL_BG_BGR = (30, 33, 38)
+_ANNOTATION_FILL_ALPHA = 110
+_NEW_ANNOTATION_FILL_ALPHA = 190
+_SUPERPIXEL_BORDER_ALPHA = 0.4
+_SUPERPIXEL_BORDER_RGBA = (255, 255, 0, int(round(255 * _SUPERPIXEL_BORDER_ALPHA)))
 
 
 def _hex_to_bgr(h: str) -> Tuple[int, int, int]:
@@ -140,6 +142,22 @@ def _scaled_poly(coords01: Sequence[Sequence[float]], sx: float, sy: float) -> n
     return pts.reshape((-1, 1, 2))
 
 
+def _scaled_polygon_with_holes(
+    border01: Sequence[Sequence[float]],
+    holes01: Optional[Sequence[Sequence[Sequence[float]]]],
+    sx: float,
+    sy: float,
+) -> Tuple[np.ndarray, Tuple[np.ndarray, ...]]:
+    border_px = _scaled_poly(border01, sx, sy)
+    holes_px: List[np.ndarray] = []
+    for hole in holes01 or []:
+        try:
+            holes_px.append(_scaled_poly(hole, sx, sy))
+        except Exception:
+            continue
+    return border_px, tuple(holes_px)
+
+
 def _scaled_line(coords01: Sequence[Sequence[float]], sx: float, sy: float) -> np.ndarray:
     arr = np.asarray(coords01, dtype=np.float32)
     if arr.ndim != 2 or arr.shape[0] < 2 or arr.shape[1] != 2:
@@ -190,6 +208,7 @@ class AnnotationData:
     parent_scribble: Tuple[int, ...]
     parent_intersect: bool
     poly_px: np.ndarray
+    holes_px: Tuple[np.ndarray, ...] = ()
 
     def signature(self) -> Tuple[int, bool, Tuple[int, ...]]:
         return self.code, self.parent_intersect, self.parent_scribble
@@ -207,7 +226,7 @@ class LoadedState:
     method: str
     scribbles: List[ScribbleData]
     annotations_by_sp: Dict[int, AnnotationData]
-    superpixels_by_id: Dict[int, np.ndarray]
+    superpixels_by_id: Dict[int, Tuple[np.ndarray, Tuple[np.ndarray, ...]]]
 
 
 @dataclass(frozen=True)
@@ -278,11 +297,16 @@ def load_state(path: Path, max_side: int, method: Optional[str]) -> LoadedState:
             )
         )
 
-    superpixels_by_id: Dict[int, np.ndarray] = {}
+    superpixels_by_id: Dict[int, Tuple[np.ndarray, Tuple[np.ndarray, ...]]] = {}
     for sp in (state.get("superpixels") or {}).get(chosen_method, []):
         sp_id = int(sp["id"])
         try:
-            superpixels_by_id[sp_id] = _scaled_poly(sp["border"], render_width, render_height)
+            superpixels_by_id[sp_id] = _scaled_polygon_with_holes(
+                sp["border"],
+                sp.get("holes"),
+                render_width,
+                render_height,
+            )
         except Exception:
             continue
 
@@ -290,21 +314,23 @@ def load_state(path: Path, max_side: int, method: Optional[str]) -> LoadedState:
     for anno in (state.get("annotations") or {}).get(chosen_method, []):
         sp_id = int(anno["parent_superpixel"])
         border = anno.get("border")
+        holes = anno.get("holes")
         if border is None and sp_id in superpixels_by_id:
-            poly_px = superpixels_by_id[sp_id]
+            poly_px, holes_px = superpixels_by_id[sp_id]
         else:
             try:
-                poly_px = _scaled_poly(border, render_width, render_height)
+                poly_px, holes_px = _scaled_polygon_with_holes(border, holes, render_width, render_height)
             except Exception:
                 if sp_id not in superpixels_by_id:
                     continue
-                poly_px = superpixels_by_id[sp_id]
+                poly_px, holes_px = superpixels_by_id[sp_id]
         annotations_by_sp[sp_id] = AnnotationData(
             sp_id=sp_id,
             code=int(anno["code"]),
             parent_scribble=tuple(int(v) for v in (anno.get("parent_scribble") or [])),
             parent_intersect=bool(anno.get("parent_intersect", True)),
             poly_px=poly_px,
+            holes_px=holes_px,
         )
 
     return LoadedState(
@@ -450,6 +476,38 @@ def _poly_points_xy(points_px: np.ndarray) -> List[Tuple[int, int]]:
     return [(int(x), int(y)) for x, y in arr]
 
 
+def _draw_polygon_with_holes(
+    draw: ImageDraw.ImageDraw,
+    outer_px: np.ndarray,
+    holes_px: Sequence[np.ndarray],
+    *,
+    fill: Optional[Tuple[int, int, int, int]] = None,
+    outline: Optional[Tuple[int, int, int, int]] = None,
+) -> None:
+    outer = _poly_points_xy(outer_px)
+    if len(outer) < 3:
+        return
+    if fill is not None:
+        draw.polygon(outer, fill=fill)
+        for hole_px in holes_px:
+            hole = _poly_points_xy(hole_px)
+            if len(hole) >= 3:
+                draw.polygon(hole, fill=(0, 0, 0, 0))
+    if outline is not None:
+        draw.polygon(outer, outline=outline)
+        for hole_px in holes_px:
+            hole = _poly_points_xy(hole_px)
+            if len(hole) >= 3:
+                draw.polygon(hole, outline=outline)
+
+
+def _emphasis_fill_alpha(frame_idx: int, frame_count: int) -> int:
+    if frame_count <= 1:
+        return _NEW_ANNOTATION_FILL_ALPHA
+    progress = min(max(float(frame_idx) / float(frame_count - 1), 0.0), 1.0)
+    return int(round(_NEW_ANNOTATION_FILL_ALPHA + (_ANNOTATION_FILL_ALPHA - _NEW_ANNOTATION_FILL_ALPHA) * progress))
+
+
 def _max_present_code(*sources: object) -> int:
     max_code = 1
     for source in sources:
@@ -488,6 +546,7 @@ def render_panel(
     scribbles: Sequence[ScribbleData],
     class_info: Sequence[Tuple[str, str]],
     show_borders: bool = True,
+    highlight_alpha: Optional[int] = None,
 ) -> np.ndarray:
     base_panel = base_image.copy() if base_image is not None else blank_background(state.render_width, state.render_height)
     base_rgba = Image.fromarray(cv2.cvtColor(base_panel, cv2.COLOR_BGR2RGB)).convert("RGBA")
@@ -495,36 +554,31 @@ def render_panel(
     draw = ImageDraw.Draw(overlay)
 
     for anno in annotations_by_sp.values():
-        poly = _poly_points_xy(anno.poly_px)
-        if len(poly) < 3:
-            continue
         class_idx = max(0, min(len(class_info) - 1, int(anno.code) - 1))
-        draw.polygon(poly, fill=_hex_to_rgba(class_info[class_idx][1], 110))
+        _draw_polygon_with_holes(
+            draw,
+            anno.poly_px,
+            anno.holes_px,
+            fill=_hex_to_rgba(class_info[class_idx][1], _ANNOTATION_FILL_ALPHA),
+        )
 
     if show_borders:
-        for poly_px in state.superpixels_by_id.values():
-            poly = _poly_points_xy(poly_px)
-            if len(poly) < 3:
-                continue
-            draw.polygon(poly, outline=(255, 255, 0, 255))
+        for poly_px, holes_px in state.superpixels_by_id.values():
+            _draw_polygon_with_holes(draw, poly_px, holes_px, outline=_SUPERPIXEL_BORDER_RGBA)
 
-    for sp_id in highlight_direct:
+    emphasis_ids = list(dict.fromkeys([*highlight_direct, *highlight_prop]))
+    emphasis_alpha = int(highlight_alpha if highlight_alpha is not None else _NEW_ANNOTATION_FILL_ALPHA)
+    for sp_id in emphasis_ids:
         anno = state.annotations_by_sp.get(sp_id)
         if anno is None:
             continue
-        poly = _poly_points_xy(anno.poly_px)
-        if len(poly) < 3:
-            continue
-        draw.polygon(poly, fill=_bgr_to_rgba(_DIRECT_BRG, 148), outline=(15, 15, 15, 255))
-
-    for sp_id in highlight_prop:
-        anno = state.annotations_by_sp.get(sp_id)
-        if anno is None:
-            continue
-        poly = _poly_points_xy(anno.poly_px)
-        if len(poly) < 3:
-            continue
-        draw.polygon(poly, fill=_bgr_to_rgba(_PROP_BRG, 128), outline=(30, 30, 30, 255))
+        class_idx = max(0, min(len(class_info) - 1, int(anno.code) - 1))
+        _draw_polygon_with_holes(
+            draw,
+            anno.poly_px,
+            anno.holes_px,
+            fill=_hex_to_rgba(class_info[class_idx][1], emphasis_alpha),
+        )
 
     composite = Image.alpha_composite(base_rgba, overlay)
     draw_scribbles = ImageDraw.Draw(composite)
@@ -597,7 +651,7 @@ def make_intro_frame(run_name: str, width: int, height: int, final_step: int, ma
 
 def metrics_footer(metrics: Optional[Dict[str, float]]) -> str:
     if not metrics:
-        return "Direct hits = orange | Propagation = cyan | Colored fill = current annotation"
+        return "New annotations briefly intensify in their class color"
     parts = []
     if "miou" in metrics:
         parts.append(f"mIoU {metrics['miou']:.3f}")
@@ -607,7 +661,7 @@ def metrics_footer(metrics: Optional[Dict[str, float]]) -> str:
         parts.append(f"precision {metrics['annotation_precision']:.3f}")
     if "annotated_px" in metrics:
         parts.append(f"annotated_px {int(round(metrics['annotated_px']))}")
-    legend = "Direct = orange | Propagation = cyan"
+    legend = "New annotations pulse in their class color"
     return " | ".join(parts + [legend]) if parts else legend
 
 
@@ -724,32 +778,38 @@ def render_run_video(
             )
 
             if event.step_delta > 0:
-                direct_panel = render_panel(
-                    state=state,
-                    base_image=prev_snapshot if prev_snapshot is not None else base_image,
-                    annotations_by_sp={} if prev_snapshot is not None else prev_annotations,
-                    highlight_direct=event.direct_sp_ids,
-                    highlight_prop=[],
-                    scribbles=new_scribbles if prev_snapshot is not None else [*prev_scribbles, *new_scribbles],
-                    class_info=class_info,
-                    show_borders=(prev_snapshot is None),
-                )
-                direct_canvas = compose_canvas(direct_panel, run_dir.name, focus_title, focus_sub, footer)
-                for _ in range(max(1, timing.direct_frames)):
+                direct_frame_count = max(1, timing.direct_frames)
+                direct_panel = None
+                for frame_idx in range(direct_frame_count):
+                    direct_panel = render_panel(
+                        state=state,
+                        base_image=prev_snapshot if prev_snapshot is not None else base_image,
+                        annotations_by_sp={} if prev_snapshot is not None else prev_annotations,
+                        highlight_direct=event.direct_sp_ids,
+                        highlight_prop=[],
+                        scribbles=new_scribbles if prev_snapshot is not None else [*prev_scribbles, *new_scribbles],
+                        class_info=class_info,
+                        show_borders=(prev_snapshot is None),
+                        highlight_alpha=_emphasis_fill_alpha(frame_idx, direct_frame_count),
+                    )
+                    direct_canvas = compose_canvas(direct_panel, run_dir.name, focus_title, focus_sub, footer)
                     writer.write(direct_canvas)
 
-                prop_panel = render_panel(
-                    state=state,
-                    base_image=prev_snapshot if prev_snapshot is not None else base_image,
-                    annotations_by_sp={} if prev_snapshot is not None else prev_annotations,
-                    highlight_direct=event.direct_sp_ids,
-                    highlight_prop=event.propagated_sp_ids,
-                    scribbles=new_scribbles if prev_snapshot is not None else [*prev_scribbles, *new_scribbles],
-                    class_info=class_info,
-                    show_borders=(prev_snapshot is None),
-                )
-                prop_canvas = compose_canvas(prop_panel, run_dir.name, focus_title, focus_sub, footer)
-                for _ in range(max(1, timing.prop_frames)):
+                prop_frame_count = max(1, timing.prop_frames)
+                prop_base = direct_panel if direct_panel is not None else (prev_snapshot if prev_snapshot is not None else base_image)
+                for frame_idx in range(prop_frame_count):
+                    prop_panel = render_panel(
+                        state=state,
+                        base_image=prop_base,
+                        annotations_by_sp={},
+                        highlight_direct=[],
+                        highlight_prop=event.propagated_sp_ids,
+                        scribbles=[],
+                        class_info=class_info,
+                        show_borders=False,
+                        highlight_alpha=_emphasis_fill_alpha(frame_idx, prop_frame_count),
+                    )
+                    prop_canvas = compose_canvas(prop_panel, run_dir.name, focus_title, focus_sub, footer)
                     writer.write(prop_canvas)
 
             if current_snapshot is not None:

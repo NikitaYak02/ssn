@@ -12,7 +12,7 @@ import hashlib
 from collections import deque
 import math
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple, Sequence, Any
 
@@ -22,7 +22,7 @@ import cv2
 from PIL import Image, ImageDraw
 
 import shapely
-from shapely.geometry import LineString, Polygon
+from shapely.geometry import LineString, Polygon, box
 from shapely import prepared
 from shapely.strtree import STRtree
 from shapely.ops import split as shp_split
@@ -56,6 +56,22 @@ def _largest_polygon(geom):
     if not polys:
         return None
     return max(polys, key=lambda p: float(p.area))
+
+
+def _geometry_to_polygons(geom) -> List[Polygon]:
+    """Best-effort conversion of arbitrary Shapely output to a list of Polygons."""
+    if geom is None or getattr(geom, "is_empty", True):
+        return []
+    if isinstance(geom, Polygon):
+        return [geom]
+    geoms = getattr(geom, "geoms", None)
+    if not geoms:
+        return []
+    out: List[Polygon] = []
+    for g in geoms:
+        if isinstance(g, Polygon) and (not g.is_empty):
+            out.append(g)
+    return out
 
 
 def _sanitize_polygon(poly: Polygon, grid_size: float = 1e-9) -> Polygon:
@@ -494,7 +510,7 @@ BBox = Tuple[float, float, float, float]  # (x0,y0,x1,y1) in [0..1]
 
 # ── Save/Load constants & exceptions ───────────────────────────────────────────
 SCHEMA_MAGIC = "spanno"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 class SaveError(RuntimeError):
@@ -597,13 +613,90 @@ def bbox_intersect(b1: BBox, b2: BBox) -> BBox:
 
 def simplify(polygon: np.ndarray, tolerance: float = 1e-10) -> np.ndarray:
     """Упростить полигон через shapely и вернуть np.array Nx2 (float32)."""
-    if polygon is None or len(polygon) < 3:
-        return polygon.astype(np.float32, copy=False)
+    if polygon is None:
+        return np.empty((0, 2), dtype=np.float32)
+    if isinstance(polygon, Polygon):
+        coords = np.asarray(polygon.exterior.coords, dtype=np.float32)
+        if coords.ndim != 2 or coords.shape[0] < 3:
+            return coords.astype(np.float32, copy=False)
+        polygon = coords
+    if len(polygon) < 3:
+        return np.asarray(polygon, dtype=np.float32)
     poly = Polygon(polygon)
     poly_s = poly.simplify(tolerance=tolerance)
     if poly_s.is_empty:
-        return polygon.astype(np.float32, copy=False)
+        return np.asarray(polygon, dtype=np.float32)
     return np.array(poly_s.boundary.coords[:], dtype=np.float32)
+
+
+def _round_ring(coords: np.ndarray, decimals: int = 7) -> np.ndarray:
+    arr = np.asarray(coords, dtype=np.float32)
+    if arr.ndim != 2 or arr.shape[1] != 2:
+        return np.empty((0, 2), dtype=np.float32)
+    return np.around(arr, decimals=decimals).astype(np.float32, copy=False)
+
+
+def _extract_polygon_rings(poly: Optional[Polygon], decimals: int = 7) -> Tuple[np.ndarray, List[np.ndarray]]:
+    if poly is None or poly.is_empty or not isinstance(poly, Polygon):
+        return np.empty((0, 2), dtype=np.float32), []
+    border = _round_ring(np.asarray(poly.exterior.coords, dtype=np.float32), decimals=decimals)
+    holes: List[np.ndarray] = []
+    for interior in poly.interiors:
+        ring = _round_ring(np.asarray(interior.coords, dtype=np.float32), decimals=decimals)
+        if ring.shape[0] >= 3:
+            holes.append(ring)
+    return border, holes
+
+
+def _polygon_from_rings(
+    border: np.ndarray,
+    holes: Optional[Sequence[np.ndarray]] = None,
+) -> Polygon:
+    border_arr = np.asarray(border, dtype=np.float32)
+    if border_arr.ndim != 2 or border_arr.shape[0] < 3 or border_arr.shape[1] != 2:
+        return Polygon()
+    hole_rings: List[np.ndarray] = []
+    for hole in holes or []:
+        hole_arr = np.asarray(hole, dtype=np.float32)
+        if hole_arr.ndim == 2 and hole_arr.shape[0] >= 3 and hole_arr.shape[1] == 2:
+            hole_rings.append(hole_arr)
+    return Polygon(border_arr, holes=hole_rings or None)
+
+
+def _binary_mask_to_polygon(mask: np.ndarray) -> Optional[Polygon]:
+    mask_bool = np.asarray(mask, dtype=bool)
+    if mask_bool.ndim != 2 or not mask_bool.any():
+        return None
+
+    spans = []
+    height, width = mask_bool.shape
+    for y in range(height):
+        xs = np.flatnonzero(mask_bool[y])
+        if xs.size == 0:
+            continue
+        start = int(xs[0])
+        prev = int(xs[0])
+        for x in xs[1:]:
+            xx = int(x)
+            if xx == prev + 1:
+                prev = xx
+                continue
+            spans.append(box(float(start), float(y), float(prev + 1), float(y + 1)))
+            start = xx
+            prev = xx
+        spans.append(box(float(start), float(y), float(prev + 1), float(y + 1)))
+
+    if not spans:
+        return None
+
+    geom = unary_union(spans)
+    poly = _largest_polygon(geom)
+    if poly is None:
+        return None
+    poly = _sanitize_polygon(poly)
+    if poly is None or poly.is_empty:
+        return None
+    return poly
 
 
 def _strtree_query_indices(tree: STRtree, geom) -> List[int]:
@@ -640,13 +733,11 @@ def labels_to_polygons(
     out_w: int,
     filter_labels: Optional[Iterable[int]] = None,
     simplify_tol: float = 1e-10,
-) -> Dict[int, np.ndarray]:
+) -> Dict[int, Polygon]:
     """Контуризация меток в нормированных координатах исходного изображения."""
     H, W = labels.shape[:2]
-    labels_extended = np.zeros((H + 2, W + 2), dtype=labels.dtype)
-    labels_extended[1:-1, 1:-1] = labels
 
-    result: Dict[int, np.ndarray] = {}
+    result: Dict[int, Polygon] = {}
     if filter_labels is None:
         lbls = sorted(int(v) for v in np.unique(labels) if v > 0)
     else:
@@ -654,19 +745,32 @@ def labels_to_polygons(
 
     x0, y0, x1, y1 = bbox01
     for lab in lbls:
-        binary = (labels_extended == lab).astype(np.uint8)
-        contours = find_contours(binary, level=0.5)
-        if not contours:
+        poly_px = _binary_mask_to_polygon(labels == lab)
+        if poly_px is None:
             continue
-        external = max(contours, key=len)[:, ::-1]  # (x, y)
-        poly = (external - 1).astype(np.float32)
-        poly[:, 0] /= float(W)
-        poly[:, 1] /= float(H)
-        poly[:, 0] = poly[:, 0] * (x1 - x0) + x0
-        poly[:, 1] = poly[:, 1] * (y1 - y0) + y0
-        poly_s = simplify(poly, tolerance=simplify_tol)
-        if poly_s is not None and len(poly_s) >= 3:
-            result[lab] = np.around(poly_s, decimals=7)
+        border, holes = _extract_polygon_rings(poly_px, decimals=7)
+        if border.shape[0] < 3:
+            continue
+
+        border = border.copy()
+        border[:, 0] /= float(W)
+        border[:, 1] /= float(H)
+        border[:, 0] = border[:, 0] * (x1 - x0) + x0
+        border[:, 1] = border[:, 1] * (y1 - y0) + y0
+        border_s = simplify(border, tolerance=simplify_tol)
+
+        scaled_holes: List[np.ndarray] = []
+        for hole in holes:
+            hole_scaled = hole.copy()
+            hole_scaled[:, 0] /= float(W)
+            hole_scaled[:, 1] /= float(H)
+            hole_scaled[:, 0] = hole_scaled[:, 0] * (x1 - x0) + x0
+            hole_scaled[:, 1] = hole_scaled[:, 1] * (y1 - y0) + y0
+            scaled_holes.append(np.around(hole_scaled, decimals=7))
+
+        poly = _sanitize_polygon(_polygon_from_rings(border_s, scaled_holes))
+        if poly is not None and (not poly.is_empty) and poly.area > 0.0:
+            result[lab] = poly
     return result
 
 
@@ -885,6 +989,7 @@ class SuperPixel:
     border: np.ndarray              # [N,2] float normalized absolute points
     parents: Optional[List[int]]    # parent SP ids if split performed
     props: Optional[np.ndarray]     # [6] mean+var LAB
+    holes: Optional[List[np.ndarray]] = None
     emb: Optional[np.ndarray] = None  # [fdim] L2-normalised mean embedding (not serialised)
 
     # Lazy caches (not serialized)
@@ -902,17 +1007,17 @@ class SuperPixel:
     def poly(self) -> Polygon:
         if self._poly_cache is None:
             # Build and sanitize polygon once, then cache.
-            p = Polygon(self.border)
+            p = _polygon_from_rings(self.border, self.holes)
             p2 = _sanitize_polygon(p)
             self._poly_cache = p2
 
-            # If sanitization changed geometry, update stored border too
-            # (so any downstream Polygon(self.border) stays healthy-ish).
+            # Keep serialized rings aligned with the sanitized geometry.
             try:
                 if (p2 is not None) and (not p2.is_empty) and (not p2.equals(p)):
-                    coords = np.asarray(p2.exterior.coords, dtype=np.float32)
-                    if coords.ndim == 2 and coords.shape[0] >= 3:
-                        self.border = np.around(coords, 7)
+                    border, holes = _extract_polygon_rings(p2, decimals=7)
+                    if border.ndim == 2 and border.shape[0] >= 3:
+                        self.border = border
+                        self.holes = holes
                         # invalidate dependent caches
                         self._prep_cache = None
                         self._centroid_cache = None
@@ -938,6 +1043,10 @@ class SuperPixel:
             "id": int(self.id),
             "method": str(self.method),
             "border": [[round(float(y), 7) for y in x] for x in self.border],
+            "holes": [
+                [[round(float(y), 7) for y in x] for x in hole]
+                for hole in (self.holes or [])
+            ],
             "parents": [] if self.parents is None else [int(i) for i in self.parents],
             "props": [] if self.props is None else [float(v) for v in np.asarray(self.props).ravel()],
         }
@@ -947,6 +1056,8 @@ class SuperPixel:
         parents = d.get("parents", []) or None
         if parents is not None:
             parents = [int(i) for i in parents]
+        holes_raw = d.get("holes", []) or []
+        holes = [np.array(h, dtype=np.float32) for h in holes_raw if len(h) >= 3]
         props = d.get("props", []) or None
         if props is not None:
             props = np.array(props, dtype=np.float32)
@@ -954,6 +1065,7 @@ class SuperPixel:
             id=int(d["id"]),
             method=str(d["method"]),
             border=np.array(d["border"], dtype=np.float32),
+            holes=holes,
             parents=parents,
             props=props,
         )
@@ -965,6 +1077,7 @@ class AnnotationInstance:
     code: int
     border: np.ndarray
     parent_superpixel: int
+    holes: Optional[List[np.ndarray]] = None
     parent_scribble: List[int] = field(default_factory=list)
     parent_intersect: bool = True
     propagation_score: Optional[float] = None
@@ -974,6 +1087,10 @@ class AnnotationInstance:
             "id": int(self.id),
             "code": int(self.code),
             "border": [[round(float(y), 7) for y in x] for x in self.border],
+            "holes": [
+                [[round(float(y), 7) for y in x] for x in hole]
+                for hole in (self.holes or [])
+            ],
             "parent_superpixel": int(self.parent_superpixel),
             "parent_scribble": [int(i) for i in self.parent_scribble],
             "parent_intersect": bool(self.parent_intersect),
@@ -989,6 +1106,7 @@ class AnnotationInstance:
             code=int(d["code"]),
             border=np.array(d["border"], dtype=np.float32),
             parent_superpixel=int(d.get("parent_superpixel", -1)),
+            holes=[np.array(h, dtype=np.float32) for h in (d.get("holes", []) or []) if len(h) >= 3],
             parent_scribble=[int(i) for i in d.get("parent_scribble", [])],
             parent_intersect=bool(d.get("parent_intersect", True)),
             propagation_score=(
@@ -1004,6 +1122,7 @@ class AnnotationInstance:
         self.code = a.code
         self.border = a.border
         self.parent_superpixel = a.parent_superpixel
+        self.holes = a.holes
         self.parent_scribble = a.parent_scribble
         self.parent_intersect = a.parent_intersect
         self.propagation_score = a.propagation_score
@@ -1111,6 +1230,235 @@ class SSNSuperpixel(SuperPixelMethod):
         )
 
 
+def _append_optional_weight_path(prefix: str, weight_path: str) -> str:
+    return f"{prefix}|{os.path.abspath(weight_path)}" if str(weight_path or "").strip() else prefix
+
+
+@dataclass(frozen=True)
+class DeepSLICSuperpixel(SuperPixelMethod):
+    weight_path: str = ""
+    nspix: int = 100
+    fdim: int = 20
+    niter: int = 5
+    backbone_width: int = 32
+    compactness: float = 8.0
+    color_scale: float = 0.26
+    pos_scale: float = 2.5
+
+    @property
+    def method_id(self) -> str:
+        return "deep_slic"
+
+    def short_string(self) -> str:
+        prefix = (
+            f"DeepSLIC_{self.nspix}_{self.fdim}_{self.niter}_{self.backbone_width}"
+            f"_{self.compactness:.4f}_{self.color_scale:.4f}_{self.pos_scale:.4f}"
+        )
+        return _append_optional_weight_path(prefix, self.weight_path)
+
+
+@dataclass(frozen=True)
+class CNNRIMSuperpixel(SuperPixelMethod):
+    weight_path: str = ""
+    nspix: int = 100
+    fdim: int = 20
+    niter: int = 5
+    backbone_width: int = 32
+    optim_steps: int = 6
+    lr: float = 0.005
+    rim_weight: float = 1.0
+    edge_weight: float = 0.25
+    color_scale: float = 0.26
+    pos_scale: float = 2.5
+
+    @property
+    def method_id(self) -> str:
+        return "cnn_rim"
+
+    def short_string(self) -> str:
+        prefix = (
+            f"CNNRIM_{self.nspix}_{self.fdim}_{self.niter}_{self.backbone_width}"
+            f"_{self.optim_steps}_{self.lr:.6f}_{self.rim_weight:.4f}"
+            f"_{self.edge_weight:.4f}_{self.color_scale:.4f}_{self.pos_scale:.4f}"
+        )
+        return _append_optional_weight_path(prefix, self.weight_path)
+
+
+@dataclass(frozen=True)
+class SPFCNSuperpixel(SuperPixelMethod):
+    weight_path: str = ""
+    nspix: int = 100
+    fdim: int = 20
+    backbone_width: int = 32
+    refine_steps: int = 2
+    color_scale: float = 0.26
+    pos_scale: float = 2.5
+
+    @property
+    def method_id(self) -> str:
+        return "sp_fcn"
+
+    def short_string(self) -> str:
+        prefix = (
+            f"SPFCN_{self.nspix}_{self.fdim}_{self.backbone_width}_{self.refine_steps}"
+            f"_{self.color_scale:.4f}_{self.pos_scale:.4f}"
+        )
+        return _append_optional_weight_path(prefix, self.weight_path)
+
+
+@dataclass(frozen=True)
+class SINSuperpixel(SuperPixelMethod):
+    weight_path: str = ""
+    nspix: int = 100
+    fdim: int = 20
+    backbone_width: int = 32
+    interp_steps: int = 3
+    color_scale: float = 0.26
+    pos_scale: float = 2.5
+
+    @property
+    def method_id(self) -> str:
+        return "sin"
+
+    def short_string(self) -> str:
+        prefix = (
+            f"SIN_{self.nspix}_{self.fdim}_{self.backbone_width}_{self.interp_steps}"
+            f"_{self.color_scale:.4f}_{self.pos_scale:.4f}"
+        )
+        return _append_optional_weight_path(prefix, self.weight_path)
+
+
+@dataclass(frozen=True)
+class RethinkUnsupSuperpixel(SuperPixelMethod):
+    weight_path: str = ""
+    nspix: int = 100
+    fdim: int = 20
+    niter: int = 5
+    backbone_width: int = 32
+    optim_steps: int = 8
+    lr: float = 0.003
+    edge_weight: float = 0.35
+    soft_recon_weight: float = 0.35
+    color_scale: float = 0.26
+    pos_scale: float = 2.5
+
+    @property
+    def method_id(self) -> str:
+        return "rethink_unsup"
+
+    def short_string(self) -> str:
+        prefix = (
+            f"RethinkUnsup_{self.nspix}_{self.fdim}_{self.niter}_{self.backbone_width}"
+            f"_{self.optim_steps}_{self.lr:.6f}_{self.edge_weight:.4f}"
+            f"_{self.soft_recon_weight:.4f}_{self.color_scale:.4f}_{self.pos_scale:.4f}"
+        )
+        return _append_optional_weight_path(prefix, self.weight_path)
+
+
+NEURAL_SUPERPIXEL_METHODS = {
+    "deep_slic": DeepSLICSuperpixel,
+    "cnn_rim": CNNRIMSuperpixel,
+    "sp_fcn": SPFCNSuperpixel,
+    "sin": SINSuperpixel,
+    "rethink_unsup": RethinkUnsupSuperpixel,
+}
+
+SUPPORTED_SUPERPIXEL_METHOD_CHOICES = (
+    "slic",
+    "felzenszwalb",
+    "fwb",
+    "watershed",
+    "ws",
+    "ssn",
+    "deep_slic",
+    "cnn_rim",
+    "sp_fcn",
+    "sin",
+    "rethink_unsup",
+)
+
+
+def parse_method_config(raw_value: Optional[str]) -> Dict[str, Any]:
+    if raw_value is None:
+        return {}
+    raw = str(raw_value).strip()
+    if not raw:
+        return {}
+    candidate = Path(raw).expanduser()
+    text = candidate.read_text(encoding="utf-8") if candidate.exists() else raw
+    cfg = json.loads(text)
+    if not isinstance(cfg, dict):
+        raise ValueError("--method-config must decode to a JSON object")
+    return cfg
+
+
+def _build_neural_superpixel_method(
+    method_id: str,
+    *,
+    method_config: Optional[Dict[str, Any]] = None,
+    weights: Optional[str] = None,
+) -> SuperPixelMethod:
+    method_id = str(method_id).strip().lower()
+    cls = NEURAL_SUPERPIXEL_METHODS.get(method_id)
+    if cls is None:
+        raise ValueError(f"Unknown neural method: {method_id!r}")
+
+    params = dict(method_config or {})
+    if weights is not None:
+        params["weight_path"] = str(weights)
+
+    valid_names = {f.name for f in fields(cls)}
+    unknown = sorted(set(params) - valid_names)
+    if unknown:
+        raise ValueError(
+            f"Unsupported config keys for {method_id}: {', '.join(unknown)}"
+        )
+    return cls(**params)
+
+
+def build_superpixel_method_from_args(args) -> SuperPixelMethod:
+    method_id = str(args.method).lower()
+    method_config = parse_method_config(getattr(args, "method_config", None))
+    weights = getattr(args, "weights", None)
+
+    if method_id == "slic":
+        return SLICSuperpixel(
+            n_clusters=int(args.n_segments),
+            compactness=float(args.compactness),
+            sigma=float(args.sigma),
+        )
+    if method_id in ("felzenszwalb", "fwb"):
+        return FelzenszwalbSuperpixel(
+            min_size=int(args.min_size),
+            sigma=float(args.f_sigma),
+            scale=float(args.scale),
+        )
+    if method_id in ("watershed", "ws"):
+        return WatershedSuperpixel(
+            compactness=float(args.ws_compactness),
+            n_components=int(args.ws_components),
+        )
+    if method_id == "ssn":
+        ssn_weight_path = getattr(args, "ssn_weights", None) or weights
+        if not ssn_weight_path:
+            raise ValueError("--ssn_weights or --weights is required for method=ssn")
+        return SSNSuperpixel(
+            weight_path=str(ssn_weight_path),
+            nspix=int(args.ssn_nspix),
+            fdim=int(args.ssn_fdim),
+            niter=int(args.ssn_niter),
+            color_scale=float(args.ssn_color_scale),
+            pos_scale=float(args.ssn_pos_scale),
+        )
+    if method_id in NEURAL_SUPERPIXEL_METHODS:
+        return _build_neural_superpixel_method(
+            method_id,
+            method_config=method_config,
+            weights=weights,
+        )
+    raise ValueError(f"Unknown method: {args.method!r}")
+
+
 def find_sp_key_in_dict(sp_method: SuperPixelMethod, sp_dict: Dict[SuperPixelMethod, List]) -> bool:
     return any(key.short_string() == sp_method.short_string() for key in sp_dict)
 
@@ -1120,6 +1468,9 @@ def _hex_to_rgba_tuple(hex_color: str, alpha: int) -> Tuple[int, int, int, int]:
     if len(h) != 6:
         raise ValueError(f"Expected #RRGGBB color, got {hex_color!r}")
     return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16), int(alpha)
+
+
+_SUPERPIXEL_BORDER_RGBA = (255, 255, 0, int(round(255 * 0.4)))
 
 
 def _edt_inside(mask: np.ndarray) -> np.ndarray:
@@ -2086,6 +2437,35 @@ def render_annotation_snapshot(
     overlay = Image.new("RGBA", (W, H), (255, 255, 255, 0))
     draw = ImageDraw.Draw(overlay)
 
+    def _scaled_rings(border: np.ndarray, holes: Optional[Sequence[np.ndarray]]) -> Tuple[List[Tuple[float, float]], List[List[Tuple[float, float]]]]:
+        outer = [(float(x * W), float(y * H)) for x, y in np.asarray(border, dtype=np.float32)]
+        inner: List[List[Tuple[float, float]]] = []
+        for hole in holes or []:
+            ring = [(float(x * W), float(y * H)) for x, y in np.asarray(hole, dtype=np.float32)]
+            if len(ring) >= 3:
+                inner.append(ring)
+        return outer, inner
+
+    def _draw_polygon_with_holes(
+        pil_draw: ImageDraw.ImageDraw,
+        border: np.ndarray,
+        holes: Optional[Sequence[np.ndarray]],
+        *,
+        fill: Optional[Tuple[int, int, int, int]] = None,
+        outline: Optional[Tuple[int, int, int, int]] = None,
+    ) -> None:
+        outer, inner = _scaled_rings(border, holes)
+        if len(outer) < 3:
+            return
+        if fill is not None:
+            pil_draw.polygon(outer, fill=fill)
+            for ring in inner:
+                pil_draw.polygon(ring, fill=(0, 0, 0, 0))
+        if outline is not None:
+            pil_draw.polygon(outer, outline=outline)
+            for ring in inner:
+                pil_draw.polygon(ring, outline=outline)
+
     if draw_annos:
         ann_obj = algo._annotations.get(sp_method)
         if ann_obj is not None:
@@ -2093,18 +2473,16 @@ def render_annotation_snapshot(
                 border = np.asarray(anno.border, dtype=np.float32)
                 if border.ndim != 2 or border.shape[0] < 3:
                     continue
-                poly = [(float(x * W), float(y * H)) for x, y in border]
                 gt_id = max(0, min(int(anno.code) - 1, len(class_info) - 1))
                 fill = _hex_to_rgba_tuple(class_info[gt_id][1], int(anno_alpha))
-                draw.polygon(poly, fill=fill)
+                _draw_polygon_with_holes(draw, border, anno.holes, fill=fill)
 
     if draw_borders:
         for sp in algo.superpixels.get(sp_method, []):
             border = np.asarray(sp.border, dtype=np.float32)
             if border.ndim != 2 or border.shape[0] < 3:
                 continue
-            poly = [(float(x * W), float(y * H)) for x, y in border]
-            draw.polygon(poly, outline=(255, 255, 0, 255))
+            _draw_polygon_with_holes(draw, border, sp.holes, outline=_SUPERPIXEL_BORDER_RGBA)
 
     composite = Image.alpha_composite(base, overlay)
     if draw_scribbles:
@@ -2226,6 +2604,25 @@ def compute_superpixels(
             prune_small_thin=True,
         )
 
+    if isinstance(
+        method,
+        (
+            DeepSLICSuperpixel,
+            CNNRIMSuperpixel,
+            SPFCNSuperpixel,
+            SINSuperpixel,
+            RethinkUnsupSuperpixel,
+        ),
+    ):
+        from lib.neural_sp.backends import compute_neural_superpixels  # noqa: PLC0415
+
+        return compute_neural_superpixels(
+            image_lab,
+            method,
+            mask=mask if has_mask else None,
+            postprocess_fn=_postprocess_superpixel_labels,
+        )
+
     raise TypeError(f"Unsupported superpixel type: {type(method)}")
 
 
@@ -2268,7 +2665,7 @@ class SuperPixelAnnotationAlgo:
             img_bgr = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
             if img_bgr is None:
                 raise FileNotFoundError(f"Can't read image: {image_path}")
-            img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB).ascontiguousarray()
+            img_rgb = np.ascontiguousarray(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
             self.image = Image.fromarray(img_rgb, mode="RGB")
 
         self._preprocess_image(downscale_coeff)
@@ -2680,30 +3077,32 @@ class SuperPixelAnnotationAlgo:
             if lab <= 0:
                 continue
             polygon = polys.get(int(lab))
-            if polygon is None or len(polygon) < 3:
+            if polygon is None or polygon.is_empty or polygon.area < 1e-8:
                 continue
             if allowed_geom is not None:
                 try:
-                    clipped = Polygon(polygon).intersection(allowed_geom)
+                    clipped = polygon.intersection(allowed_geom)
                     clipped_poly = _largest_polygon(_sanitize_polygon(clipped))
                 except Exception as clip_err:
                     logger.warning("Failed to clip ROI polygon to allowed bbox area: %s", clip_err)
                     continue
                 if clipped_poly is None or clipped_poly.is_empty or clipped_poly.area < 1e-8:
                     continue
-                polygon = np.asarray(clipped_poly.exterior.coords, dtype=np.float32)
-                if polygon.ndim != 2 or polygon.shape[0] < 3:
-                    continue
+                polygon = clipped_poly
             region_props = []
             region_props.extend(means[i])
             region_props.extend(variances[i])
+            border, holes = _extract_polygon_rings(polygon, decimals=7)
+            if border.ndim != 2 or border.shape[0] < 3:
+                continue
             self.superpixels[superpixel_method].append(
                 SuperPixel(
                     id=self._superpixel_ind[superpixel_method],
                     method=superpixel_method.short_string(),
-                    border=np.asarray(polygon, dtype=np.float32),
+                    border=border,
                     parents=[],
                     props=np.array(region_props, dtype=np.float32),
+                    holes=holes,
                     emb=label_embs.get(int(lab)),
                 )
             )
@@ -3175,29 +3574,21 @@ class SuperPixelAnnotationAlgo:
 
     @staticmethod
     def _parse_method_from_string(method_str: str) -> SuperPixelMethod:
-        # SSN strings contain "|" to separate numeric params from the path.
-        if method_str.startswith("SSN_") and "|" in method_str:
-            try:
-                pipe = method_str.index("|")
-                prefix_parts = method_str[:pipe].split("_")
-                # prefix_parts: ["SSN", nspix, fdim, niter, color_scale, pos_scale]
-                weight_path = method_str[pipe + 1:]
-                return SSNSuperpixel(
-                    nspix=int(prefix_parts[1]),
-                    fdim=int(prefix_parts[2]),
-                    niter=int(prefix_parts[3]),
-                    color_scale=float(prefix_parts[4]),
-                    pos_scale=float(prefix_parts[5]),
-                    weight_path=weight_path,
-                )
-            except Exception as e:
-                raise ValueError(
-                    f"Failed to parse SSN method string '{method_str}': {e}"
-                )
-
-        parts = method_str.split("_")
+        prefix, weight_path = (
+            method_str.split("|", 1) if "|" in method_str else (method_str, "")
+        )
+        parts = prefix.split("_")
         try:
             mt = parts[0]
+            if mt == "SSN" and len(parts) == 6:
+                return SSNSuperpixel(
+                    nspix=int(parts[1]),
+                    fdim=int(parts[2]),
+                    niter=int(parts[3]),
+                    color_scale=float(parts[4]),
+                    pos_scale=float(parts[5]),
+                    weight_path=weight_path,
+                )
             if mt == "SLIC" and len(parts) == 4:
                 return SLICSuperpixel(n_clusters=int(parts[1]),
                                       compactness=float(parts[2]),
@@ -3209,6 +3600,65 @@ class SuperPixelAnnotationAlgo:
             if mt == "Watershed" and len(parts) == 3:
                 return WatershedSuperpixel(compactness=float(parts[1]),
                                            n_components=int(parts[2]))
+            if mt == "DeepSLIC" and len(parts) == 8:
+                return DeepSLICSuperpixel(
+                    weight_path=weight_path,
+                    nspix=int(parts[1]),
+                    fdim=int(parts[2]),
+                    niter=int(parts[3]),
+                    backbone_width=int(parts[4]),
+                    compactness=float(parts[5]),
+                    color_scale=float(parts[6]),
+                    pos_scale=float(parts[7]),
+                )
+            if mt == "CNNRIM" and len(parts) == 11:
+                return CNNRIMSuperpixel(
+                    weight_path=weight_path,
+                    nspix=int(parts[1]),
+                    fdim=int(parts[2]),
+                    niter=int(parts[3]),
+                    backbone_width=int(parts[4]),
+                    optim_steps=int(parts[5]),
+                    lr=float(parts[6]),
+                    rim_weight=float(parts[7]),
+                    edge_weight=float(parts[8]),
+                    color_scale=float(parts[9]),
+                    pos_scale=float(parts[10]),
+                )
+            if mt == "SPFCN" and len(parts) == 7:
+                return SPFCNSuperpixel(
+                    weight_path=weight_path,
+                    nspix=int(parts[1]),
+                    fdim=int(parts[2]),
+                    backbone_width=int(parts[3]),
+                    refine_steps=int(parts[4]),
+                    color_scale=float(parts[5]),
+                    pos_scale=float(parts[6]),
+                )
+            if mt == "SIN" and len(parts) == 7:
+                return SINSuperpixel(
+                    weight_path=weight_path,
+                    nspix=int(parts[1]),
+                    fdim=int(parts[2]),
+                    backbone_width=int(parts[3]),
+                    interp_steps=int(parts[4]),
+                    color_scale=float(parts[5]),
+                    pos_scale=float(parts[6]),
+                )
+            if mt == "RethinkUnsup" and len(parts) == 11:
+                return RethinkUnsupSuperpixel(
+                    weight_path=weight_path,
+                    nspix=int(parts[1]),
+                    fdim=int(parts[2]),
+                    niter=int(parts[3]),
+                    backbone_width=int(parts[4]),
+                    optim_steps=int(parts[5]),
+                    lr=float(parts[6]),
+                    edge_weight=float(parts[7]),
+                    soft_recon_weight=float(parts[8]),
+                    color_scale=float(parts[9]),
+                    pos_scale=float(parts[10]),
+                )
         except Exception as e:
             raise ValueError(f"Failed to parse method string '{method_str}': {e}")
         raise ValueError(f"Unknown/invalid method string: {method_str}")
@@ -3255,13 +3705,8 @@ class SuperPixelAnnotationAlgo:
     def _clip_poly_to_superpixel(self, poly_norm: Polygon, sp_poly: Polygon) -> List[Polygon]:
         try:
             geom = poly_norm.intersection(sp_poly.buffer(0))
-            if geom.is_empty:
-                return []
-            if isinstance(geom, Polygon):
-                geoms = [geom]
-            elif isinstance(geom, shapely.MultiPolygon):
-                geoms = list(geom.geoms)
-            else:
+            geoms = _geometry_to_polygons(geom)
+            if not geoms:
                 return []
             out = []
             for g in geoms:
@@ -3573,6 +4018,7 @@ class SuperPixelAnnotationAlgo:
                             code=seed_code,
                             border=cand_sp.border.astype(np.float32),
                             parent_superpixel=int(cand_sp.id),
+                            holes=None if cand_sp.holes is None else [h.astype(np.float32) for h in cand_sp.holes],
                             parent_scribble=[scribble.id],
                             parent_intersect=bool(parent_intersect),
                             propagation_score=(
@@ -3676,6 +4122,7 @@ class SuperPixelAnnotationAlgo:
                             code=last_scribble.params.code,
                             border=anno_obj.border,
                             parent_superpixel=anno_obj.parent_superpixel,
+                            holes=anno_obj.holes,
                             parent_scribble=[int(last_scribble.id)],
                             parent_intersect=True,
                         )
@@ -3693,6 +4140,7 @@ class SuperPixelAnnotationAlgo:
                             code=last_scribble.params.code,
                             border=anno_obj.border,
                             parent_superpixel=anno_obj.parent_superpixel,
+                            holes=anno_obj.holes,
                             parent_scribble=[int(last_scribble.id)],
                             parent_intersect=True,
                         )
@@ -3749,9 +4197,15 @@ class SuperPixelAnnotationAlgo:
                             if int(lab) <= 0:
                                 continue
                             poly_arr = polys.get(int(lab))
-                            if poly_arr is None or len(poly_arr) < 3:
+                            if poly_arr is None:
                                 continue
-                            raw_piece = Polygon(poly_arr)
+                            if isinstance(poly_arr, Polygon):
+                                raw_piece = poly_arr
+                            else:
+                                poly_arr = np.asarray(poly_arr, dtype=np.float32)
+                                if poly_arr.ndim != 2 or poly_arr.shape[0] < 3:
+                                    continue
+                                raw_piece = Polygon(poly_arr)
                             if raw_piece.is_empty:
                                 continue
                             for piece in self._clip_poly_to_superpixel(raw_piece, sp_poly):
@@ -3763,8 +4217,8 @@ class SuperPixelAnnotationAlgo:
                                 if piece.is_empty or (not isinstance(piece, Polygon)) or piece.area < 1e-8:
                                     logger.warning("SP split: dropped degenerate piece (area=%.3g, sp_id=%d).", float(getattr(piece, 'area', 0.0)), int(cur_superpixel.id))
                                     continue
-                                coords = np.asarray(piece.exterior.coords, dtype=np.float32)
-                                if coords.shape[0] < 3:
+                                border, holes = _extract_polygon_rings(piece, decimals=7)
+                                if border.shape[0] < 3:
                                     print(i_lbl, " exited by coords < 3")
                                     continue
                                 rp = self._roi_from_norm_poly(piece, pad=1)
@@ -3778,9 +4232,10 @@ class SuperPixelAnnotationAlgo:
                                 tmp.append(SuperPixel(
                                     id=-1,
                                     method=superpixel_method.short_string(),
-                                    border=np.around(coords, 7),
+                                    border=border,
                                     parents=list((cur_superpixel.parents or [])) + [cur_superpixel.id],
-                                    props=props_arr
+                                    props=props_arr,
+                                    holes=holes,
                                 ))
 
                         # проверка: один кусок — коды штрихов не смешиваются
@@ -3816,8 +4271,9 @@ class SuperPixelAnnotationAlgo:
                         try:
                             pieces = shp_split(sp_poly.buffer(0), scribble_line)
                             tmp = []
-                            if getattr(pieces, "geoms", None) and len(pieces.geoms) >= 2:
-                                for piece in pieces.geoms:
+                            piece_polys = _geometry_to_polygons(pieces)
+                            if len(piece_polys) >= 2:
+                                for piece in piece_polys:
                                     try:
                                         piece = piece.buffer(0)  # чинит самопересечения
                                     except Exception as _e:
@@ -3826,8 +4282,8 @@ class SuperPixelAnnotationAlgo:
                                     if piece.is_empty or (not isinstance(piece, Polygon)) or piece.area < 1e-8:
                                         logger.warning("SP split: dropped degenerate piece (area=%.3g, sp_id=%d).", float(getattr(piece, 'area', 0.0)), int(cur_superpixel.id))
                                         continue
-                                    coords = np.asarray(piece.exterior.coords, dtype=np.float32)
-                                    if coords.shape[0] < 3:
+                                    border, holes = _extract_polygon_rings(piece, decimals=7)
+                                    if border.shape[0] < 3:
                                         continue
                                     rp = self._roi_from_norm_poly(piece, pad=1)
                                     mp = self._rasterize_poly_to_roi_mask(piece, rp)
@@ -3835,9 +4291,10 @@ class SuperPixelAnnotationAlgo:
                                     tmp.append(SuperPixel(
                                         id=-1,
                                         method=superpixel_method.short_string(),
-                                        border=np.around(coords, 7),
+                                        border=border,
                                         parents=list((cur_superpixel.parents or [])) + [cur_superpixel.id],
-                                        props=props_arr
+                                        props=props_arr,
+                                        holes=holes,
                                     ))
                             else:
                                 tmp = []
@@ -3889,6 +4346,7 @@ class SuperPixelAnnotationAlgo:
                         code=last_scribble.params.code,
                         border=cur_superpixel.border.astype(np.float32),
                         parent_superpixel=int(cur_superpixel.id),
+                        holes=None if cur_superpixel.holes is None else [h.astype(np.float32) for h in cur_superpixel.holes],
                         parent_scribble=[int(last_scribble.id)],
                         parent_intersect=True,
                     )
@@ -3904,7 +4362,7 @@ class SuperPixelAnnotationAlgo:
                     if res is not None:
                         results.append(res)
                 except Exception as e:
-                    logger.warning("candidate failed: %s", e)
+                    logger.exception("candidate failed: %s", e)
 
         # 5) Применение планов
         superpixel_ind_to_del = sorted({i for r in results for i in r.superpixel_ind_to_del})
@@ -4023,6 +4481,7 @@ class SuperPixelAnnotationAlgo:
                         code=int(code),
                         border=sp.border.astype(np.float32),
                         parent_superpixel=int(sp.id),
+                        holes=None if sp.holes is None else [h.astype(np.float32) for h in sp.holes],
                         parent_scribble=[int(s) for s in sids] if sids else [int(last_scribble.id)],
                         parent_intersect=bool(any(poly.intersects(id2geom[s]) for s in sids)) if sids else True,
                     )
@@ -4078,7 +4537,7 @@ class SuperPixelAnnotationAlgo:
                 f.write(f"SP: {sp_poly.wkt}\n")
                 f.write(f"SCRIBBLE: {LineString(scribble.points).wkt}\n")
                 for i, p in enumerate(pieces):
-                    f.write(f"PIECE[{i}]: {Polygon(p.border).wkt}\n")
+                    f.write(f"PIECE[{i}]: {p.poly.wkt}\n")
         except Exception as e:
             logger.debug("debug dump failed: %s", e)
 
@@ -4126,11 +4585,7 @@ class SuperPixelAnnotationAlgo:
         # Если дыры «существенные» — раскладываем и добавляем
         if (miss is not None) and (not miss.is_empty):
             try:
-                geoms = []
-                if isinstance(miss, Polygon):
-                    geoms = [miss]
-                elif isinstance(miss, shapely.MultiPolygon):
-                    geoms = list(miss.geoms)
+                geoms = _geometry_to_polygons(miss)
                 add_list: List[SuperPixel] = []
                 for g in geoms:
                     g = g.buffer(0)
@@ -4138,8 +4593,8 @@ class SuperPixelAnnotationAlgo:
                         continue
                     if g.area < area_tol:
                         continue
-                    coords = np.asarray(g.exterior.coords, dtype=np.float32)
-                    if coords.shape[0] < 3:
+                    border, holes = _extract_polygon_rings(g, decimals=7)
+                    if border.shape[0] < 3:
                         continue
                     # props по ROI
                     rp = self._roi_from_norm_poly(g, pad=1)
@@ -4148,15 +4603,16 @@ class SuperPixelAnnotationAlgo:
                     add_list.append(SuperPixel(
                         id=-1,
                         method=self.superpixel_methods[0].short_string(),
-                        border=np.around(coords, 7),
+                        border=border,
                         parents=None,
-                        props=props_arr
+                        props=props_arr,
+                        holes=holes,
                     ))
                 if add_list:
                     pieces = pieces + add_list
                     # обновим coverage после добавления
                     try:
-                        uni2 = unary_union([Polygon(p.border) for p in pieces]).buffer(0)
+                        uni2 = unary_union([p.poly for p in pieces]).buffer(0)
                         coverage = float(uni2.area) / max(total_area, 1e-12)
                     except Exception:
                         # ок, оставим прежний coverage
