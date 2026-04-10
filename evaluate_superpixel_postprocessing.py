@@ -2,7 +2,7 @@
 """
 Batch evaluation of segmentation quality before and after superpixel postprocessing.
 
-The script mirrors the notebook logic from test_sp_postproc.ipynb:
+The script mirrors the notebook logic from docs/notebooks/test_sp_postproc.ipynb:
 1. load an HRNet checkpoint from petroscope,
 2. perturb a selected weight tensor with Gaussian noise,
 3. run segmentation on a folder of images,
@@ -15,8 +15,8 @@ Example:
     evaluate_superpixel_postprocessing.py \
     --images ../target_dataset/S1_v2/imgs/test \
     --masks ../target_dataset/S1_v2/masks/test \
-    --checkpoint S1v2_S2v2_x05.pth \
-    --output-dir out/sp_postproc_eval \
+    --checkpoint models/checkpoints/S1v2_S2v2_x05.pth \
+    --output-dir artifacts/postprocessing/sp_postproc_eval \
     --device mps
 """
 
@@ -1082,10 +1082,14 @@ def apply_overwrite_policy(
     sp_labels: np.ndarray,
     sp_conf: np.ndarray,
     baseline_sp_labels: np.ndarray,
+    accept_sp: np.ndarray,
 ) -> np.ndarray:
     sp_flat_labels = sp_labels[flat_sp]
     if strategy.overwrite_policy == "all":
-        return sp_flat_labels.astype(np.int32)
+        out_flat = pixel_labels.copy()
+        mask = accept_sp[flat_sp]
+        out_flat[mask] = sp_flat_labels[mask]
+        return out_flat.astype(np.int32)
 
     out_flat = pixel_labels.copy()
     if strategy.overwrite_policy == "low_pixel_conf":
@@ -1105,8 +1109,58 @@ def apply_overwrite_policy(
     else:  # pragma: no cover - validated by strategy registry
         raise ValueError(f"Unknown overwrite policy: {strategy.overwrite_policy}")
 
+    mask &= accept_sp[flat_sp]
     out_flat[mask] = sp_flat_labels[mask]
     return out_flat.astype(np.int32)
+
+
+def compute_superpixel_accept_mask(
+    *,
+    strategy: SuperpixelRefinementStrategy,
+    flat_sp: np.ndarray,
+    counts: np.ndarray,
+    pixel_labels: np.ndarray,
+    pixel_conf: np.ndarray,
+    sp_labels: np.ndarray,
+    scores: np.ndarray,
+) -> np.ndarray:
+    num_sp = counts.shape[0]
+    accept_sp = np.ones(num_sp, dtype=bool)
+
+    if float(strategy.min_superpixel_margin) > 0.0:
+        if scores.shape[0] > 1:
+            top2 = np.partition(scores, kth=scores.shape[0] - 2, axis=0)[-2:]
+            sp_margin = (top2[-1] - top2[-2]).astype(np.float32)
+        else:
+            sp_margin = scores[0].astype(np.float32)
+        accept_sp &= sp_margin >= float(strategy.min_superpixel_margin)
+
+    if bool(strategy.enforce_superpixel_confidence_guard):
+        sp_conf = scores.max(axis=0).astype(np.float32)
+        accept_sp &= sp_conf >= float(strategy.superpixel_confidence_threshold)
+
+    changed_flat = pixel_labels != sp_labels[flat_sp]
+    changed_counts = np.bincount(
+        flat_sp,
+        weights=changed_flat.astype(np.float32),
+        minlength=num_sp,
+    ).astype(np.float32)
+    change_fraction = changed_counts / np.maximum(counts, 1.0)
+    accept_sp &= change_fraction <= float(strategy.max_change_fraction)
+
+    if float(strategy.max_changed_mean_confidence) < 1.0:
+        changed_conf_sum = np.bincount(
+            flat_sp,
+            weights=pixel_conf * changed_flat.astype(np.float32),
+            minlength=num_sp,
+        ).astype(np.float32)
+        changed_conf_mean = changed_conf_sum / np.maximum(changed_counts, 1.0)
+        has_changes = changed_counts > 0.0
+        accept_sp &= (~has_changes) | (
+            changed_conf_mean <= float(strategy.max_changed_mean_confidence)
+        )
+
+    return accept_sp
 
 
 def superpixel_postprocess_strategy(
@@ -1153,11 +1207,21 @@ def superpixel_postprocess_strategy(
 
     sp_labels = scores.argmax(axis=0).astype(np.int32)
     sp_conf = scores.max(axis=0).astype(np.float32)
+    counts = np.bincount(flat_sp, minlength=num_sp).astype(np.float32)
     baseline_sp_labels = compute_superpixel_majority_labels(
         pixel_labels,
         flat_sp,
         num_sp,
         channels,
+    )
+    accept_sp = compute_superpixel_accept_mask(
+        strategy=strategy,
+        flat_sp=flat_sp,
+        counts=counts,
+        pixel_labels=pixel_labels,
+        pixel_conf=pixel_conf,
+        sp_labels=sp_labels,
+        scores=scores,
     )
     out_flat = apply_overwrite_policy(
         strategy=strategy,
@@ -1167,6 +1231,7 @@ def superpixel_postprocess_strategy(
         sp_labels=sp_labels,
         sp_conf=sp_conf,
         baseline_sp_labels=baseline_sp_labels,
+        accept_sp=accept_sp,
     )
 
     if strategy.cleanup_mode == "none":
@@ -1187,7 +1252,6 @@ def superpixel_postprocess_strategy(
             max_component_size=int(strategy.small_component_superpixels),
         )
     elif strategy.cleanup_mode == "conservative":
-        counts = np.bincount(flat_sp, minlength=num_sp).astype(np.float32)
         eligible_mask = stage1_sp_labels != baseline_sp_labels
         stage2_sp_labels = cleanup_small_superpixel_components_conservative(
             stage1_sp_labels,

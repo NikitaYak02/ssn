@@ -21,6 +21,7 @@ OVERWRITE_POLICIES = {
 }
 
 CLEANUP_MODES = {"none", "simple", "conservative"}
+SAFE_DEFAULT_STRATEGY_ID = "safe_mean_t075_safe_non_degrading_v2"
 
 
 @dataclass(frozen=True)
@@ -40,6 +41,10 @@ class SuperpixelRefinementStrategy:
     cleanup_mode: str = "none"
     small_component_superpixels: int = 3
     neighbor_ratio_threshold: float = 0.6
+    min_superpixel_margin: float = 0.0
+    max_change_fraction: float = 1.0
+    max_changed_mean_confidence: float = 1.0
+    enforce_superpixel_confidence_guard: bool = False
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -62,6 +67,12 @@ def _validate_strategy(strategy: SuperpixelRefinementStrategy) -> SuperpixelRefi
         raise ValueError("graph_alpha must be in [0, 1]")
     if strategy.small_component_superpixels < 1:
         raise ValueError("small_component_superpixels must be >= 1")
+    if strategy.min_superpixel_margin < 0.0:
+        raise ValueError("min_superpixel_margin must be >= 0")
+    if not (0.0 < strategy.max_change_fraction <= 1.0):
+        raise ValueError("max_change_fraction must be in (0, 1]")
+    if not (0.0 < strategy.max_changed_mean_confidence <= 1.0):
+        raise ValueError("max_changed_mean_confidence must be in (0, 1]")
     return strategy
 
 
@@ -405,6 +416,98 @@ def generate_novel_refinement_strategies(limit: int = 100) -> list[SuperpixelRef
     return out
 
 
+def generate_safe_refinement_strategies() -> list[SuperpixelRefinementStrategy]:
+    aggregates = [
+        ("safe_mean_t075", "mean_proba", 0.75, 0.0, 1.0),
+        ("safe_mean_t085", "mean_proba", 0.85, 0.0, 1.0),
+        ("safe_confw_p10", "confidence_weighted_mean", 1.0, 0.0, 1.0),
+        ("safe_confw_p20_t085", "confidence_weighted_mean", 0.85, 0.0, 2.0),
+        ("safe_margin_p15", "margin_weighted_mean", 1.0, 0.0, 1.5),
+    ]
+    profiles = [
+        (
+            "safe_non_degrading_v1",
+            "Strict disagreement-only updates with tight baseline-preserving guard.",
+            0.45,
+            1,
+            0.15,
+            "none",
+            2,
+            0.10,
+            0.10,
+            0.45,
+            0.88,
+        ),
+        (
+            "safe_non_degrading_v2",
+            "Disagreement-only updates with moderate guard and very limited footprint.",
+            0.50,
+            1,
+            0.20,
+            "none",
+            2,
+            0.08,
+            0.15,
+            0.48,
+            0.86,
+        ),
+        (
+            "safe_non_degrading_v3",
+            "Conservative disagreement updates with tiny-island cleanup only under strong evidence.",
+            0.50,
+            1,
+            0.25,
+            "simple",
+            2,
+            0.12,
+            0.12,
+            0.50,
+            0.90,
+        ),
+    ]
+    out: list[SuperpixelRefinementStrategy] = []
+    for family, aggregate_mode, temperature, prior_power, weight_power in aggregates:
+        for (
+            suffix,
+            description,
+            pixel_thr,
+            graph_steps,
+            graph_alpha,
+            cleanup_mode,
+            small_comp,
+            min_margin,
+            max_frac,
+            max_mean_conf,
+            sp_conf_thr,
+        ) in profiles:
+            out.append(
+                _validate_strategy(
+                    SuperpixelRefinementStrategy(
+                        strategy_id=f"{family}_{suffix}",
+                        description=description,
+                        family=family,
+                        aggregate_mode=aggregate_mode,
+                        overwrite_policy="disagree_low_pixel_conf",
+                        pixel_confidence_threshold=float(pixel_thr),
+                        superpixel_confidence_threshold=float(sp_conf_thr),
+                        prior_power=float(prior_power),
+                        temperature=float(temperature),
+                        weight_power=float(weight_power),
+                        graph_steps=int(graph_steps),
+                        graph_alpha=float(graph_alpha),
+                        cleanup_mode=cleanup_mode,
+                        small_component_superpixels=int(small_comp),
+                        neighbor_ratio_threshold=0.6,
+                        min_superpixel_margin=float(min_margin),
+                        max_change_fraction=float(max_frac),
+                        max_changed_mean_confidence=float(max_mean_conf),
+                        enforce_superpixel_confidence_guard=True,
+                    )
+                )
+            )
+    return out
+
+
 def named_strategy_catalog(
     *,
     confidence_threshold: float = 0.75,
@@ -424,5 +527,9 @@ def named_strategy_catalog(
                 hybrid_neighbor_ratio=hybrid_neighbor_ratio,
             )
         )
+    strategies.extend(generate_safe_refinement_strategies())
     strategies.extend(generate_novel_refinement_strategies(limit=novel_limit))
-    return {strategy.strategy_id: strategy for strategy in strategies}
+    catalog = {strategy.strategy_id: strategy for strategy in strategies}
+    if SAFE_DEFAULT_STRATEGY_ID in catalog:
+        catalog["safe_non_degrading"] = catalog[SAFE_DEFAULT_STRATEGY_ID]
+    return catalog

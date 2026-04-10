@@ -46,6 +46,7 @@ from evaluate_superpixel_postprocessing import (
 from superpixel_refinement_strategies import (
     SuperpixelRefinementStrategy,
     generate_novel_refinement_strategies,
+    generate_safe_refinement_strategies,
 )
 
 
@@ -91,7 +92,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--suite",
         default="simple",
-        choices=["simple", "novel100", "all"],
+        choices=["simple", "novel100", "safe", "all"],
         help="Which refinement suite to benchmark.",
     )
     parser.add_argument(
@@ -194,6 +195,9 @@ def build_method_entries(
                 hybrid_neighbor_ratio=args.hybrid_neighbor_ratio,
             )
             entries.append((method_name, description, strategy))
+    if args.suite in {"safe", "all"}:
+        for strategy in generate_safe_refinement_strategies():
+            entries.append((strategy.strategy_id, strategy.description, strategy))
     if args.suite in {"novel100", "all"}:
         for strategy in generate_novel_refinement_strategies(limit=args.strategy_limit):
             entries.append((strategy.strategy_id, strategy.description, strategy))
