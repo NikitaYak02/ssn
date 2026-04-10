@@ -137,6 +137,7 @@ python benchmark_configs.py --img_dir ... --mask_dir ...
 
 ```
 ssn/
+├── README.md                      # Корневая карта проекта
 ├── train.py                      # Основной скрипт тренировки
 ├── profile_one_batch.py         # Профайлинг одного батча
 ├── benchmark_configs.py         # Бенчмарк разных конфигов
@@ -154,7 +155,11 @@ ssn/
 │       ├── metrics.py           # ASA, BR, UE, Compactness
 │       ├── meter.py             # EMA loss tracker
 │       └── profiler.py          # BatchProfiler
-└── PROFILING.md                  # Документация по профайлингу
+├── docs/
+│   └── optimization/
+│       └── PROFILING.md         # Документация по профайлингу
+└── docs/scripts/
+    └── compare.md               # Подробный запуск compare.py
 ```
 
 ## Отличия от исходной версии
@@ -174,7 +179,7 @@ ssn/
 
 - [`PROFILING.md`](./PROFILING.md) — Подробный гайд по профайлингу
 - [`OPTIMIZATIONS_SUMMARY.md`](./OPTIMIZATIONS_SUMMARY.md) — Полное описание всех оптимизаций
-- [`compare.py`](./compare.py) — Сравнение SSN vs SLIC
+- [`compare.md`](../scripts/compare.md) — Сравнение SSN vs SLIC и запуск из CLI
 
 ## Поддерживаемые GPU
 
@@ -213,4 +218,4 @@ ssn/
 - Экспериментировать с `--nspix`, `--niter`, `--crop_size`
 - Запустить на полном датасете
 - Проверить метрики на validation set каждые 10000 итераций
-- Использовать `best_model.pth` для инференса
+- Использовать checkpoint из `models/checkpoints/` или из каталога конкретного training-run для инференса

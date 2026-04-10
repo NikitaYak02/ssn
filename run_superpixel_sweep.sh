@@ -10,10 +10,10 @@ else
   PYTHON_BIN="python3"
 fi
 
-IMAGE_PATH="${1:-$ROOT_DIR/_quarter_run/input/train_01_q1.jpg}"
-MASK_PATH="${2:-$ROOT_DIR/_quarter_run/input/train_01_q1.png}"
-OUTPUT_DIR="${3:-$ROOT_DIR/_quarter_run/sweeps/default_100}"
-SSN_WEIGHTS="${4:-$ROOT_DIR/best_model.pth}"
+IMAGE_PATH="${1:-$ROOT_DIR/artifacts/case_studies/_quarter_run/input/train_01_q1.jpg}"
+MASK_PATH="${2:-$ROOT_DIR/artifacts/case_studies/_quarter_run/input/train_01_q1.png}"
+OUTPUT_DIR="${3:-$ROOT_DIR/artifacts/sweeps/default_100}"
+SSN_WEIGHTS="${4:-$ROOT_DIR/models/checkpoints/best_model.pth}"
 EXTRA_ARGS=("${@:5}")
 
 if command -v sysctl >/dev/null 2>&1; then

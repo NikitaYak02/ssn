@@ -44,7 +44,11 @@ def parse_args() -> argparse.Namespace:
     )
     ap.add_argument("--img_dir", required=True, help="Directory with RGB images.")
     ap.add_argument("--mask_dir", required=True, help="Directory with grayscale masks.")
-    ap.add_argument("--out_dir", default="./out/neural_superpixels", help="Output directory.")
+    ap.add_argument(
+        "--out_dir",
+        default="./artifacts/training/neural_superpixels",
+        help="Output directory.",
+    )
     ap.add_argument(
         "--method",
         required=True,

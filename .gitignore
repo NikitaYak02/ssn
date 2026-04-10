@@ -13,18 +13,11 @@ __pycache__/
 venv/
 superpixel_annotator/superpixel_annotator_venv/
 
-_debug_candidates/
-_single_image_input/
-out/
-log/
-results_*/
-sens_*/
-precomputed_ssn_500/
+artifacts/
+reports/generated/
 
 *.log
 *.pth
 *.pt
 *.ckpt
 *.zip
-
-test_sp_postproc.ipynb

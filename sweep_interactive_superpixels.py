@@ -12,11 +12,11 @@ pair by:
 Example:
     superpixel_annotator/superpixel_annotator_venv/bin/python \
       sweep_interactive_superpixels.py \
-      --image _quarter_run/input/train_01_q1.jpg \
-      --mask _quarter_run/input/train_01_q1.png \
-      --output-dir out/sweeps/train01_100 \
+      --image artifacts/case_studies/_quarter_run/input/train_01_q1.jpg \
+      --mask artifacts/case_studies/_quarter_run/input/train_01_q1.png \
+      --output-dir artifacts/sweeps/train01_100 \
       --methods felzenszwalb,slic,ssn \
-      --ssn-weights best_model.pth \
+      --ssn-weights models/checkpoints/best_model.pth \
       --scribbles 100 \
       --workers 4
 """

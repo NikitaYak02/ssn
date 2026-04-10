@@ -19,12 +19,12 @@ longer available. For an exact step-by-step replay, run
 Examples:
     superpixel_annotator/superpixel_annotator_venv/bin/python \
         render_interactive_annotation_video.py \
-        --input out/interactive_repro_train01_ssn \
+        --input artifacts/case_studies/interactive_repro_train01_ssn \
         --image /path/to/image.png
 
     superpixel_annotator/superpixel_annotator_venv/bin/python \
         render_interactive_annotation_video.py \
-        --input out/batch_results \
+        --input artifacts/case_studies/ssn_s1_v2_halfsize \
         --image_dir /data/images \
         --fps 8
 """

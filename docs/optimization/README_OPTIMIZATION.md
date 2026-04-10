@@ -1,5 +1,8 @@
 # SSN Training Pipeline - Optimization Complete
 
+Repository note: these optimization materials now live in `docs/optimization/`
+instead of the repository root.
+
 This document indexes all optimization work done to the training pipeline.
 
 ## Current Status
@@ -113,13 +116,13 @@ This document indexes all optimization work done to the training pipeline.
 
 ```
 ssn/
+├── README.md                         ← Корневая карта проекта
 ├── train.py                          ← Main training script (uses Albumentations)
 ├── profile_minimal.py                ← Profile without worker overhead
 ├── profile_one_batch.py              ← Profile with workers
 ├── benchmark_configs.py              ← Compare configurations
 ├── compare.py                        ← Compare two checkpoints
-├── infer.py                          ← Inference script
-│
+├── inference.py                      ← Inference script
 ├── model.py                          ← SSN model
 ├── lib/
 │   ├── ssn/
@@ -132,18 +135,21 @@ ssn/
 │       ├── profiler.py              ← Timing measurements
 │       ├── loss.py                  ← Loss functions
 │       └── metrics.py               ← Evaluation metrics
-│
-├── QUICK_START_ALBUMENTATIONS.md    ← 2-minute start
-├── QUICK_START_OPTIMIZED.md         ← Config by hardware
-├── CHANGES_SUMMARY.md               ← What changed
-├── ALBUMENTATIONS_INTEGRATION.md    ← Integration details
-├── AUGMENTATION_STRATEGIES.md       ← Strategy reference
-├── TESTING_ALBUMENTATIONS.md        ← Detailed testing
-├── PROFILING_BASELINE.md            ← Expected results
-├── PROFILING.md                     ← How to profile
-├── PROFILING_TROUBLESHOOT.md        ← Troubleshooting
-├── OPTIMIZATIONS_SUMMARY.md         ← All optimizations
-└── README_OPTIMIZATION.md           ← This file
+├── docs/
+│   └── optimization/
+│       ├── QUICK_START_ALBUMENTATIONS.md
+│       ├── QUICK_START_OPTIMIZED.md
+│       ├── CHANGES_SUMMARY.md
+│       ├── ALBUMENTATIONS_INTEGRATION.md
+│       ├── AUGMENTATION_STRATEGIES.md
+│       ├── TESTING_ALBUMENTATIONS.md
+│       ├── PROFILING_BASELINE.md
+│       ├── PROFILING.md
+│       ├── PROFILING_TROUBLESHOOT.md
+│       ├── OPTIMIZATIONS_SUMMARY.md
+│       └── README_OPTIMIZATION.md   ← This file
+├── docs/scripts/                    ← Автодокументация по CLI-скриптам
+└── reports/                         ← Автогенерируемые отчеты по репозиторию
 ```
 
 ---

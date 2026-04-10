@@ -10,8 +10,8 @@ Example:
     tune_hybrid_conservative.py \
     --images ../target_dataset/S1_v2/imgs/test \
     --masks ../target_dataset/S1_v2/masks/test \
-    --checkpoint S1v2_S2v2_x05.pth \
-    --output-dir out/hybrid_tune \
+    --checkpoint models/checkpoints/S1v2_S2v2_x05.pth \
+    --output-dir artifacts/postprocessing/hybrid_tune \
     --device mps \
     --no-noise \
     --limit 5
