@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Parallel parameter sweep for interactive superpixel annotation runs.
 
-The script compares `felzenszwalb`, `slic`, and `ssn` on the same image/mask
+The script compares one or more superpixel methods on the same image/mask
 pair by:
 
 1. building a parameter grid for each requested method,
@@ -40,6 +40,26 @@ from typing import Any, Iterable, Optional
 from PIL import Image
 
 
+METHOD_ALIASES = {
+    "fwb": "felzenszwalb",
+    "ws": "watershed",
+}
+NEURAL_METHODS = {
+    "deep_slic",
+    "cnn_rim",
+    "sp_fcn",
+    "sin",
+    "rethink_unsup",
+}
+SIMPLE_METHODS = {
+    "felzenszwalb",
+    "slic",
+    "watershed",
+}
+ACCELERATED_METHODS = {"ssn", *NEURAL_METHODS}
+SUPPORTED_METHODS = SIMPLE_METHODS | ACCELERATED_METHODS
+
+
 def parse_csv_list(raw: str) -> list[str]:
     values = [item.strip() for item in str(raw).split(",") if item.strip()]
     if not values:
@@ -53,6 +73,71 @@ def parse_float_csv(raw: str) -> list[float]:
 
 def parse_int_csv(raw: str) -> list[int]:
     return [int(v) for v in parse_csv_list(raw)]
+
+
+def normalize_method_name(value: str) -> str:
+    method = str(value).strip().lower()
+    if not method:
+        raise ValueError("Expected a non-empty method name.")
+    return METHOD_ALIASES.get(method, method)
+
+
+def parse_method_list(raw: str) -> list[str]:
+    methods: list[str] = []
+    seen: set[str] = set()
+    for value in parse_csv_list(raw):
+        method = normalize_method_name(value)
+        if method not in seen:
+            seen.add(method)
+            methods.append(method)
+    return methods
+
+
+def parse_json_value(raw: Optional[str]) -> Any:
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not text:
+        return None
+    candidate = Path(text).expanduser()
+    if candidate.exists():
+        text = candidate.read_text(encoding="utf-8")
+    return json.loads(text)
+
+
+def parse_neural_method_configs(raw: Optional[str]) -> dict[str, list[dict[str, Any]]]:
+    payload = parse_json_value(raw)
+    if payload is None:
+        return {}
+    if not isinstance(payload, dict):
+        raise ValueError("--neural-method-configs must decode to a JSON object.")
+
+    parsed: dict[str, list[dict[str, Any]]] = {}
+    for method_name, configs in payload.items():
+        method = normalize_method_name(str(method_name))
+        if method not in NEURAL_METHODS:
+            raise ValueError(
+                f"--neural-method-configs only supports neural methods, got: {method_name!r}"
+            )
+        if isinstance(configs, dict):
+            configs = [configs]
+        if not isinstance(configs, list) or not configs:
+            raise ValueError(
+                f"Expected a non-empty config list for neural method {method!r}."
+            )
+        rows: list[dict[str, Any]] = []
+        for config in configs:
+            if not isinstance(config, dict):
+                raise ValueError(
+                    f"Neural config for {method!r} must be a JSON object, got: {type(config)!r}"
+                )
+            rows.append(dict(config))
+        parsed[method] = rows
+    return parsed
+
+
+def serialize_method_config(config: dict[str, Any]) -> str:
+    return json.dumps(config, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
 def sanitize_token(value: Any) -> str:
@@ -92,7 +177,11 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument(
         "--methods",
         default="felzenszwalb,slic,ssn",
-        help="Comma-separated methods subset: felzenszwalb,slic,ssn",
+        help=(
+            "Comma-separated methods subset. Supported: "
+            "felzenszwalb/fwb, slic, watershed/ws, ssn, "
+            "deep_slic, cnn_rim, sp_fcn, sin, rethink_unsup."
+        ),
     )
     ap.add_argument(
         "--workers",
@@ -104,13 +193,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--simple-workers",
         type=int,
         default=None,
-        help="Parallel workers for CPU-only methods (felzenszwalb, slic). Defaults to --workers.",
+        help=(
+            "Parallel workers for CPU-only methods "
+            "(felzenszwalb, slic, watershed). Defaults to --workers."
+        ),
     )
     ap.add_argument(
         "--ssn-workers",
         type=int,
         default=1,
-        help="Parallel workers for SSN cases. Keep low to avoid GPU/VRAM oversubscription.",
+        help=(
+            "Parallel workers for SSN and neural-method cases. "
+            "Keep low to avoid GPU/VRAM oversubscription."
+        ),
     )
     ap.add_argument(
         "--overwrite",
@@ -151,6 +246,10 @@ def build_parser() -> argparse.ArgumentParser:
     grp_s.add_argument("--slic-compactnesses", default="10,20,30")
     grp_s.add_argument("--slic-sigmas", default="0.0,1.0")
 
+    grp_w = ap.add_argument_group("Watershed grid")
+    grp_w.add_argument("--ws-compactnesses", default="0.0001")
+    grp_w.add_argument("--ws-components-list", default="500")
+
     grp_ssn = ap.add_argument_group("SSN grid")
     grp_ssn.add_argument("--ssn-weights", default=None, help="SSN checkpoint (.pth)")
     grp_ssn.add_argument("--ssn-nspix-list", default="200,500,800")
@@ -158,22 +257,66 @@ def build_parser() -> argparse.ArgumentParser:
     grp_ssn.add_argument("--ssn-niter-list", default="5")
     grp_ssn.add_argument("--ssn-color-scales", default="0.26")
     grp_ssn.add_argument("--ssn-pos-scales", default="2.5")
+
+    grp_n = ap.add_argument_group("Neural method configs")
+    grp_n.add_argument(
+        "--neural-method-configs",
+        default=None,
+        help=(
+            "JSON string or path to a JSON object mapping neural method ids "
+            "to one or more config dicts. Each config may include method "
+            "fields and optional weights/weight_path."
+        ),
+    )
     return ap
 
 
+def iter_case_label_params(params: dict[str, Any]) -> Iterable[tuple[str, Any]]:
+    for key, value in sorted(params.items()):
+        if key in {"weights", "ssn_weights"} and value is not None:
+            yield key, Path(str(value)).name
+            continue
+        if key == "method_config":
+            try:
+                decoded = json.loads(str(value))
+            except Exception:
+                decoded = None
+            if isinstance(decoded, dict):
+                for sub_key, sub_value in sorted(decoded.items()):
+                    yield f"cfg_{sub_key}", sub_value
+                continue
+        yield key, value
+
+
+def build_neural_case_params(config: dict[str, Any]) -> dict[str, Any]:
+    raw_config = dict(config)
+    weight_value = raw_config.pop("weights", None)
+    if weight_value is None:
+        weight_value = raw_config.pop("weight_path", None)
+
+    params: dict[str, Any] = {}
+    if raw_config:
+        params["method_config"] = serialize_method_config(raw_config)
+    if weight_value is not None and str(weight_value).strip():
+        params["weights"] = str(Path(str(weight_value)).expanduser().resolve())
+    return params
+
+
 def build_cases(args: argparse.Namespace, output_dir: Path) -> list[SweepCase]:
-    methods = set(parse_csv_list(args.methods))
-    supported = {"felzenszwalb", "slic", "ssn"}
-    unknown = sorted(methods - supported)
+    methods = parse_method_list(args.methods)
+    unknown = sorted(set(methods) - SUPPORTED_METHODS)
     if unknown:
         raise ValueError(f"Unsupported methods requested: {unknown}")
+    neural_method_configs = parse_neural_method_configs(args.neural_method_configs)
 
     cases: list[SweepCase] = []
     spanno_dir = output_dir / "spanno"
     runs_dir = output_dir / "runs"
 
     def add_case(method: str, params: dict[str, Any]) -> None:
-        token_parts = [method] + [f"{k}_{sanitize_token(v)}" for k, v in sorted(params.items())]
+        token_parts = [method] + [
+            f"{k}_{sanitize_token(v)}" for k, v in iter_case_label_params(params)
+        ]
         label = "__".join(token_parts)
         cases.append(
             SweepCase(
@@ -215,6 +358,19 @@ def build_cases(args: argparse.Namespace, output_dir: Path) -> list[SweepCase]:
                 },
             )
 
+    if "watershed" in methods:
+        for compactness, n_components in itertools.product(
+            parse_float_csv(args.ws_compactnesses),
+            parse_int_csv(args.ws_components_list),
+        ):
+            add_case(
+                "watershed",
+                {
+                    "ws_compactness": float(compactness),
+                    "ws_components": int(n_components),
+                },
+            )
+
     if "ssn" in methods:
         if not args.ssn_weights:
             raise ValueError("--ssn-weights is required when ssn is included in --methods.")
@@ -235,6 +391,13 @@ def build_cases(args: argparse.Namespace, output_dir: Path) -> list[SweepCase]:
                     "ssn_pos_scale": float(pos_scale),
                 },
             )
+
+    for method in methods:
+        if method not in NEURAL_METHODS:
+            continue
+        configs = neural_method_configs.get(method) or [{}]
+        for config in configs:
+            add_case(method, build_neural_case_params(config))
 
     return cases
 
@@ -327,29 +490,28 @@ def ensure_spanno(case: SweepCase, image_path: str, overwrite: bool) -> tuple[in
         auto_propagation_sensitivity=0.0,
     )
 
-    if case.method == "felzenszwalb":
-        sp_method = structs.FelzenszwalbSuperpixel(
-            min_size=int(case.params["min_size"]),
-            sigma=float(case.params["f_sigma"]),
-            scale=float(case.params["scale"]),
-        )
-    elif case.method == "slic":
-        sp_method = structs.SLICSuperpixel(
-            n_clusters=int(case.params["n_segments"]),
-            compactness=float(case.params["compactness"]),
-            sigma=float(case.params["sigma"]),
-        )
-    elif case.method == "ssn":
-        sp_method = structs.SSNSuperpixel(
-            weight_path=str(case.params["ssn_weights"]),
-            nspix=int(case.params["ssn_nspix"]),
-            fdim=int(case.params["ssn_fdim"]),
-            niter=int(case.params["ssn_niter"]),
-            color_scale=float(case.params["ssn_color_scale"]),
-            pos_scale=float(case.params["ssn_pos_scale"]),
-        )
-    else:
-        raise ValueError(f"Unsupported method: {case.method}")
+    method_args = argparse.Namespace(
+        method=case.method,
+        method_config=None,
+        weights=None,
+        n_segments=3000,
+        compactness=20.0,
+        sigma=1.0,
+        scale=400.0,
+        f_sigma=1.0,
+        min_size=50,
+        ws_compactness=1e-4,
+        ws_components=500,
+        ssn_weights=None,
+        ssn_nspix=100,
+        ssn_fdim=20,
+        ssn_niter=5,
+        ssn_color_scale=0.26,
+        ssn_pos_scale=2.5,
+    )
+    for key, value in case.params.items():
+        setattr(method_args, key, value)
+    sp_method = structs.build_superpixel_method_from_args(method_args)
 
     algo.add_superpixel_method(sp_method)
     n_superpixels = populate_full_image_superpixels(algo, sp_method)
@@ -419,10 +581,11 @@ def build_eval_command(args: argparse.Namespace, case: SweepCase) -> list[str]:
         cmd.extend(["--num_classes", str(int(args.num_classes))])
 
     for key, value in sorted(case.params.items()):
-        if key == "ssn_weights":
-            cmd.extend(["--ssn_weights", str(value)])
+        if isinstance(value, (dict, list)):
+            value_text = json.dumps(value, ensure_ascii=False, sort_keys=True)
         else:
-            cmd.extend([f"--{key}", str(value)])
+            value_text = str(value)
+        cmd.extend([f"--{key}", value_text])
     return cmd
 
 
@@ -650,8 +813,8 @@ def main() -> int:
     }
 
     rows: list[dict[str, Any]] = []
-    simple_cases = [case for case in cases if case.method in {"felzenszwalb", "slic"}]
-    ssn_cases = [case for case in cases if case.method == "ssn"]
+    simple_cases = [case for case in cases if case.method in SIMPLE_METHODS]
+    accelerated_cases = [case for case in cases if case.method in ACCELERATED_METHODS]
 
     if simple_cases:
         print(
@@ -668,13 +831,13 @@ def main() -> int:
             output_dir=output_dir,
         )
 
-    if ssn_cases:
+    if accelerated_cases:
         print(
-            f"Running {len(ssn_cases)} SSN cases with {ssn_workers} workers",
+            f"Running {len(accelerated_cases)} SSN/neural cases with {ssn_workers} workers",
             flush=True,
         )
         run_cases(
-            cases=ssn_cases,
+            cases=accelerated_cases,
             max_workers=ssn_workers,
             worker_args=worker_args,
             rows=rows,

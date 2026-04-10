@@ -2564,7 +2564,10 @@ def compute_superpixels(
 
     # --- Watershed ---
     if isinstance(method, WatershedSuperpixel):
-        elev = sobel(lab2rgb(image_lab).astype(np.float32))
+        rgb = lab2rgb(image_lab).astype(np.float32, copy=False)
+        # Watershed expects a scalar elevation map; using a 3-channel tensor
+        # here can produce a 3-D label volume instead of 2-D superpixel labels.
+        elev = sobel(np.mean(rgb, axis=2))
         labels = sk_ws(
             elev, markers=int(n_segment_dynamic),
             compactness=float(method.compactness),
