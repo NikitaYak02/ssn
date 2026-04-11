@@ -65,9 +65,13 @@ class InMemorySegmentationDataset:
     """
 
     def __init__(self, img_dir, mask_dir, split="train", val_ratio=0.1,
-                 max_classes=50, geo_transforms=None, verbose=True):
+                 max_classes=50, geo_transforms=None, verbose=True,
+                 image_downscale=1.0):
         self.max_classes = max_classes
         self.geo_transforms = geo_transforms
+        self.image_downscale = float(image_downscale)
+        if self.image_downscale <= 0:
+            raise ValueError("image_downscale must be > 0")
 
         pairs = _collect_pairs(img_dir, mask_dir)
         if not pairs:
@@ -83,23 +87,32 @@ class InMemorySegmentationDataset:
             pairs = pairs[:n_val]
         # split == "all" → keep everything
 
+        progress_interval = max(1, len(pairs) // 10) if len(pairs) > 0 else 1
         if verbose:
-            print(f"[{split}] preloading {len(pairs)} samples into RAM …",
-                  end=" ", flush=True)
+            print(f"[{split}] preloading {len(pairs)} samples into RAM …", flush=True)
 
         self.images: list[np.ndarray] = []
         self.masks:  list[np.ndarray] = []
 
-        for img_path, mask_path in pairs:
-            img  = np.array(Image.open(img_path).convert('RGB'))   # uint8
-            mask = np.array(Image.open(mask_path).convert('L'))    # uint8
+        for idx, (img_path, mask_path) in enumerate(pairs, start=1):
+            img_pil = Image.open(img_path).convert('RGB')
+            mask_pil = Image.open(mask_path).convert('L')
+            if self.image_downscale < 1.0:
+                new_w = max(1, int(round(img_pil.width * self.image_downscale)))
+                new_h = max(1, int(round(img_pil.height * self.image_downscale)))
+                img_pil = img_pil.resize((new_w, new_h), resample=Image.Resampling.BILINEAR)
+                mask_pil = mask_pil.resize((new_w, new_h), resample=Image.Resampling.NEAREST)
+            img = np.array(img_pil)    # uint8
+            mask = np.array(mask_pil)  # uint8
             self.images.append(img)
             self.masks.append(mask)
+            if verbose and (idx % progress_interval == 0 or idx == len(pairs)):
+                print(f"[{split}] preload progress: {idx}/{len(pairs)}", flush=True)
 
         if verbose:
             img_mb  = sum(x.nbytes for x in self.images)  / 1e6
             mask_mb = sum(x.nbytes for x in self.masks)   / 1e6
-            print(f"done  ({img_mb + mask_mb:.0f} MB)")
+            print(f"[{split}] preload done ({img_mb + mask_mb:.0f} MB)")
 
     # ------------------------------------------------------------------
     def __len__(self):

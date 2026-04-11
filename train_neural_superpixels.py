@@ -5,6 +5,7 @@ import argparse
 import json
 import math
 import os
+import signal
 import sys
 import time
 from dataclasses import asdict
@@ -14,6 +15,7 @@ import numpy as np
 import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 
 from lib.dataset import augmentation
 from lib.dataset.custom_dataset import InMemorySegmentationDataset
@@ -36,6 +38,75 @@ sys.path.insert(0, str(_SCRIPT_DIR / "superpixel_annotator"))
 sys.path.insert(0, str(_SCRIPT_DIR))
 
 import structs  # noqa: E402
+
+
+def _read_vmrss_bytes(pid: int) -> int:
+    status_path = Path(f"/proc/{pid}/status")
+    try:
+        for line in status_path.read_text(encoding="utf-8").splitlines():
+            if line.startswith("VmRSS:"):
+                parts = line.split()
+                if len(parts) >= 2:
+                    return int(parts[1]) * 1024
+    except (FileNotFoundError, ProcessLookupError, PermissionError, ValueError):
+        return 0
+    return 0
+
+
+def _iter_descendant_pids(root_pid: int) -> set[int]:
+    to_visit = [int(root_pid)]
+    visited: set[int] = set()
+    while to_visit:
+        pid = to_visit.pop()
+        if pid in visited:
+            continue
+        visited.add(pid)
+        children_path = Path(f"/proc/{pid}/task/{pid}/children")
+        try:
+            children_raw = children_path.read_text(encoding="utf-8").strip()
+        except (FileNotFoundError, ProcessLookupError, PermissionError):
+            continue
+        if not children_raw:
+            continue
+        for child in children_raw.split():
+            try:
+                to_visit.append(int(child))
+            except ValueError:
+                continue
+    return visited
+
+
+def _process_tree_rss_bytes(root_pid: int) -> int:
+    total = 0
+    for pid in _iter_descendant_pids(root_pid):
+        total += _read_vmrss_bytes(pid)
+    return total
+
+
+def _format_gb(num_bytes: int) -> str:
+    return f"{num_bytes / (1024 ** 3):.2f} GB"
+
+
+def enforce_ram_limit(max_ram_gb: float, context: str) -> None:
+    if float(max_ram_gb) <= 0:
+        return
+    limit_bytes = int(float(max_ram_gb) * (1024 ** 3))
+    used_bytes = _process_tree_rss_bytes(os.getpid())
+    if used_bytes <= limit_bytes:
+        return
+
+    message = (
+        f"RAM limit exceeded during {context}: "
+        f"{_format_gb(used_bytes)} > {_format_gb(limit_bytes)} "
+        "(sum RSS of training process + workers)."
+    )
+    print(message, file=sys.stderr)
+    # Send SIGTERM to our own process group so DataLoader workers stop too.
+    try:
+        os.killpg(os.getpgid(0), signal.SIGTERM)
+    except Exception:
+        pass
+    raise RuntimeError(message)
 
 
 def parse_args() -> argparse.Namespace:
@@ -68,8 +139,32 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--compactness_weight", type=float, default=1e-5)
     ap.add_argument("--edge_reg_weight", type=float, default=5e-4)
     ap.add_argument("--eval_downscale", type=float, default=1.0)
+    ap.add_argument(
+        "--data_downscale",
+        type=float,
+        default=1.0,
+        help=(
+            "Downscale source images/masks during dataset preload "
+            "(applies to both train and val splits)."
+        ),
+    )
     ap.add_argument("--print_interval", type=int, default=50)
     ap.add_argument("--test_interval", type=int, default=250)
+    ap.add_argument(
+        "--max_ram_gb",
+        type=float,
+        default=50.0,
+        help=(
+            "Hard safety limit for total RAM usage (process tree RSS, including "
+            "DataLoader workers). Set <=0 to disable."
+        ),
+    )
+    ap.add_argument(
+        "--memory_check_interval",
+        type=int,
+        default=10,
+        help="Check RAM usage every N training iterations.",
+    )
     return ap.parse_args()
 
 
@@ -86,6 +181,7 @@ def create_loaders(args: argparse.Namespace):
         val_ratio=args.val_ratio,
         max_classes=args.max_classes,
         geo_transforms=augment,
+        image_downscale=args.data_downscale,
     )
     val_dataset = InMemorySegmentationDataset(
         args.img_dir,
@@ -94,6 +190,7 @@ def create_loaders(args: argparse.Namespace):
         val_ratio=args.val_ratio,
         max_classes=args.max_classes,
         geo_transforms=None,
+        image_downscale=args.data_downscale,
     )
 
     train_loader = DataLoader(
@@ -169,7 +266,10 @@ def evaluate_model(
     model.eval()
     for inputs_lab, labels_u8 in val_loader:
         inputs_lab = inputs_lab.to(device)
-        gt = labels_u8.argmax(1).float()
+        # labels_u8 is (B, C, H*W); restore spatial map for interpolation logic.
+        gt = labels_u8.argmax(1).reshape(
+            labels_u8.shape[0], inputs_lab.shape[-2], inputs_lab.shape[-1]
+        ).float()
         if float(eval_downscale) < 1.0:
             new_h = max(32, int(inputs_lab.shape[-2] * float(eval_downscale)))
             new_w = max(32, int(inputs_lab.shape[-1] * float(eval_downscale)))
@@ -209,6 +309,7 @@ def evaluate_model(
 def main() -> int:
     args = parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
+    enforce_ram_limit(args.max_ram_gb, context="startup")
     method = build_method(args)
     device = get_torch_device(torch)
 
@@ -236,59 +337,78 @@ def main() -> int:
     best_metrics: dict[str, float] = {}
     start_time = time.time()
     iterations = 0
+    method_name = _method_id(method)
 
     train_iter = iter(train_loader)
-    while iterations < args.train_iter:
-        try:
-            inputs_lab, labels_u8 = next(train_iter)
-        except StopIteration:
-            train_iter = iter(train_loader)
-            inputs_lab, labels_u8 = next(train_iter)
+    progress = tqdm(
+        total=args.train_iter,
+        initial=iterations,
+        desc=f"train:{method_name}",
+        unit="it",
+        dynamic_ncols=True,
+    )
+    try:
+        while iterations < args.train_iter:
+            try:
+                inputs_lab, labels_u8 = next(train_iter)
+            except StopIteration:
+                train_iter = iter(train_loader)
+                inputs_lab, labels_u8 = next(train_iter)
 
-        model.train()
-        inputs_lab = inputs_lab.to(device, non_blocking=True)
-        optimizer.zero_grad(set_to_none=True)
-        loss, stats = forward_assignment(
-            inputs_lab,
-            labels_u8,
-            model=model,
-            method=method,
-            compactness_weight=args.compactness_weight,
-            edge_reg_weight=args.edge_reg_weight,
-        )
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
-
-        iterations += 1
-        meter.add(stats)
-
-        if iterations % args.print_interval == 0:
-            elapsed = max(time.time() - start_time, 1e-6)
-            print(meter.state(f"[{iterations}/{args.train_iter}]", f"| {iterations / elapsed:.2f} it/s"))
-
-        if iterations % args.test_interval == 0 or iterations == args.train_iter:
-            val_metrics = evaluate_model(
-                model,
-                method,
-                val_loader,
-                device,
-                eval_downscale=float(args.eval_downscale),
+            model.train()
+            inputs_lab = inputs_lab.to(device, non_blocking=True)
+            optimizer.zero_grad(set_to_none=True)
+            loss, stats = forward_assignment(
+                inputs_lab,
+                labels_u8,
+                model=model,
+                method=method,
+                compactness_weight=args.compactness_weight,
+                edge_reg_weight=args.edge_reg_weight,
             )
-            print(
-                f"eval@{iterations} asa={val_metrics['asa']:.4f} br={val_metrics['br']:.4f} "
-                f"ue={val_metrics['ue']:.4f} compactness={val_metrics['compactness']:.4f}"
-            )
-            if val_metrics["asa"] >= best_asa:
-                best_asa = val_metrics["asa"]
-                best_metrics = val_metrics
-                save_neural_method_checkpoint(
-                    os.path.join(args.out_dir, "best_model.pth"),
-                    method=method,
-                    model=model,
-                    metrics=val_metrics,
-                    extra_meta={"iteration": iterations},
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+
+            iterations += 1
+            progress.update(1)
+            if args.memory_check_interval > 0 and (iterations % args.memory_check_interval == 0):
+                enforce_ram_limit(args.max_ram_gb, context=f"iteration {iterations}")
+            meter.add(stats)
+
+            if iterations % args.print_interval == 0:
+                elapsed = max(time.time() - start_time, 1e-6)
+                progress.set_postfix(
+                    loss=f"{meter.params.get('loss', float('nan')):.4f}",
+                    sem=f"{meter.params.get('semantic', float('nan')):.4f}",
+                    comp=f"{meter.params.get('compact', float('nan')):.2e}",
+                    ips=f"{iterations / elapsed:.2f}",
                 )
+
+            if iterations % args.test_interval == 0 or iterations == args.train_iter:
+                val_metrics = evaluate_model(
+                    model,
+                    method,
+                    val_loader,
+                    device,
+                    eval_downscale=float(args.eval_downscale),
+                )
+                progress.write(
+                    f"eval@{iterations} asa={val_metrics['asa']:.4f} br={val_metrics['br']:.4f} "
+                    f"ue={val_metrics['ue']:.4f} compactness={val_metrics['compactness']:.4f}"
+                )
+                if val_metrics["asa"] >= best_asa:
+                    best_asa = val_metrics["asa"]
+                    best_metrics = val_metrics
+                    save_neural_method_checkpoint(
+                        os.path.join(args.out_dir, "best_model.pth"),
+                        method=method,
+                        model=model,
+                        metrics=val_metrics,
+                        extra_meta={"iteration": iterations},
+                    )
+    finally:
+        progress.close()
 
     save_neural_method_checkpoint(
         os.path.join(args.out_dir, "last_model.pth"),
