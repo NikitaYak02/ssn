@@ -21,3 +21,4 @@ reports/generated/
 *.pt
 *.ckpt
 *.zip
+!models/checkpoints/best_model.pth

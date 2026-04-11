@@ -9,6 +9,7 @@
 - `docs/scripts/` — подробная документация по запуску всех CLI-скриптов.
 - `docs/notebooks/` — ноутбуки и исследовательские заметки.
 - `models/checkpoints/` — сохраненные checkpoint-файлы, которые используются в примерах и evaluation.
+  В репозитории хранится `models/checkpoints/best_model.pth` для SSN-сценариев из документации.
 - `artifacts/` — все прогоны, sweep/refinement, precomputed/spanno, постобработка, case-study и debug-артефакты.
 - `reports/` — человекочитаемые отчеты по текущему состоянию репозитория.
 - `reports/generated/` — машинно-читаемые инвентари и каталоги, из которых собираются отчеты.
