@@ -22,6 +22,7 @@
 | `profile_one_batch.py` | да | `profiling` | директория изображений, директория масок | stdout, логи и/или артефакты в путях, переданных через CLI | [profile_one_batch.md](profile_one_batch.md) |
 | `refine_superpixel_on_pairs.py` | да | `refinement` | checkpoint / веса модели, JSON со списком пар image/mask | директория результатов | [refine_superpixel_on_pairs.md](refine_superpixel_on_pairs.md) |
 | `render_interactive_annotation_video.py` | да | `visualization` | директория результата или одиночный run-каталог | директория результатов, MP4-видео | [render_interactive_annotation_video.md](render_interactive_annotation_video.md) |
+| `report_superpixel_anything_overlap.py` | да | `report` | опционально путь для markdown-отчета | markdown-отчет | [report_superpixel_anything_overlap.md](report_superpixel_anything_overlap.md) |
 | `run_superpixel_sweep.sh` | да | `shell-wrapper` | аргументы командной строки и входные пути по конкретному сценарию | stdout, логи и/или артефакты в путях, переданных через CLI | [run_superpixel_sweep.md](run_superpixel_sweep.md) |
 | `superpixel_annotator/structs.py` | нет | `library` | аргументы командной строки и входные пути по конкретному сценарию | stdout, логи и/или артефакты в путях, переданных через CLI | [superpixel_annotator__structs.md](superpixel_annotator__structs.md) |
 | `superpixel_annotator/test_struct_biggest.py` | да | `legacy-cli` | аргументы командной строки и входные пути по конкретному сценарию | stdout, логи и/или артефакты в путях, переданных через CLI | [superpixel_annotator__test_struct_biggest.md](superpixel_annotator__test_struct_biggest.md) |
@@ -32,6 +33,7 @@
 | `superpixel_refinement_strategies.py` | нет | `library` | аргументы командной строки и входные пути по конкретному сценарию | stdout, логи и/или артефакты в путях, переданных через CLI | [superpixel_refinement_strategies.md](superpixel_refinement_strategies.md) |
 | `sweep_interactive_superpixels.py` | да | `sweep` | одно изображение, одна GT-маска, checkpoint / веса модели | директория результатов | [sweep_interactive_superpixels.md](sweep_interactive_superpixels.md) |
 | `train.py` | да | `training` | директория изображений, директория масок | директория результатов | [train.md](train.md) |
+| `train_external_superpixels.py` | да | `training` | BSD-style root или директории изображений/масок | директория результатов | [train_external_superpixels.md](train_external_superpixels.md) |
 | `train_neural_superpixels.py` | да | `training` | директория изображений, директория масок, checkpoint / веса модели | директория результатов | [train_neural_superpixels.md](train_neural_superpixels.md) |
 | `tune_hybrid_conservative.py` | да | `optimization` | директория изображений, директория масок, готовый on-disk cache, checkpoint / веса модели | директория результатов | [tune_hybrid_conservative.md](tune_hybrid_conservative.md) |
 | `tune_low_confidence_threshold.py` | да | `optimization` | готовый on-disk cache | директория результатов | [tune_low_confidence_threshold.md](tune_low_confidence_threshold.md) |

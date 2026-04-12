@@ -1,0 +1,18 @@
+{
+  "method_id": "spam",
+  "display_name": "SPAM (Superpixel Anything Model)",
+  "paper_url": "https://arxiv.org/abs/2509.12791",
+  "repo_url": "https://github.com/waldo-j/spam",
+  "commit": "0c7431bf76bb560a20a829ff58a7e81387a0b952",
+  "default_repo_dir": "{repo_root}/.external_sources/spam",
+  "default_venv_dir": "{repo_root}/.method_envs/spam",
+  "train": {
+    "entrypoint": "{repo_dir}/SPAM/train.py",
+    "cwd": "{repo_dir}/SPAM",
+    "requirements": "{repo_dir}/requirements.txt"
+  },
+  "inference": {
+    "entrypoint": "{repo_dir}/SPAM/inference.py",
+    "cwd": "{repo_dir}/SPAM"
+  }
+}

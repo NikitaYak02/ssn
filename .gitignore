@@ -12,6 +12,8 @@ __pycache__/
 .venv/
 venv/
 superpixel_annotator/superpixel_annotator_venv/
+.external_sources/
+.method_envs/
 
 artifacts/
 reports/generated/

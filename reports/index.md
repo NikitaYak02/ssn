@@ -16,6 +16,7 @@
 - [Хранилище и очистка](storage_and_cleanup.md)
 - [Geology Shortlist](geology_shortlist.md)
 - [Bring-Up External Methods](generated/external_methods_bringup_status.md)
+- [Superpixel Anything Overlap](superpixel_anything_overlap.md)
 
 ## Зоны репозитория
 

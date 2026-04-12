@@ -5,6 +5,7 @@
 - Для top-level скриптов используйте Python 3.12+.
 - Создайте отдельное окружение проекта и установите зависимости из `requirements.txt`.
 - Если нужен самый простой reproducible вариант для evaluation/legacy-сценариев, используйте bundled venv: `superpixel_annotator/superpixel_annotator_venv/bin/python`.
+- Для внешних upstream-методов вроде `SPAM` используйте отдельные окружения в `.method_envs/`, а сами upstream-клоны держите в `.external_sources/`.
 
 ## Рекомендуемый порядок
 
@@ -37,6 +38,7 @@ pip install -r requirements.txt
 ## Скрипты, которым нужен dataset
 
 - `train.py`
+- `train_external_superpixels.py`
 - `train_neural_superpixels.py`
 - `compare.py`
 - `benchmark_configs.py`
@@ -71,6 +73,7 @@ pip install -r requirements.txt
 ## Куда складывать новые результаты
 
 - Новые training/fine-tuning результаты удобно складывать в `artifacts/training/`.
+- Внешние upstream-репозитории и их venv не храните в git: используйте `.external_sources/` и `.method_envs/`.
 - Интерактивные прогоны складывайте в `artifacts/interactive_runs/`.
 - Sweep/refinement лучше держать в `artifacts/sweeps/` и `artifacts/refinement/`.
 - Постобработку и сравнения держите в `artifacts/postprocessing/`.
