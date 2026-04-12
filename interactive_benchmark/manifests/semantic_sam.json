@@ -1,0 +1,17 @@
+{
+  "method_id": "semantic_sam",
+  "display_name": "Semantic-SAM",
+  "prompt_type": "point",
+  "paper_url": "https://arxiv.org/abs/2307.04767",
+  "repo_url": "https://github.com/UX-Decoder/Semantic-SAM",
+  "commit": "e11f8b518539faea731e2744cc3e44c24572e30d",
+  "weights": "https://github.com/UX-Decoder/Semantic-SAM/releases/download/checkpoint/swint_only_sam_many2many.pth",
+  "disabled_reason": "Official Semantic-SAM install path requires detectron2-based stack with CUDA-oriented dependencies; local Apple Silicon automation is not completed yet.",
+  "runtime": {
+    "cwd": "",
+    "env": {}
+  },
+  "entrypoint": {
+    "command": []
+  }
+}

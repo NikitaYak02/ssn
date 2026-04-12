@@ -1,0 +1,41 @@
+{
+  "method_id": "interformer",
+  "display_name": "InterFormer",
+  "prompt_type": "point",
+  "paper_url": "https://arxiv.org/abs/2304.02942",
+  "repo_url": "https://github.com/YouHuang67/InterFormer",
+  "commit": "c2d7f5dbe3bf2434504fc29fe05dece06673b53b",
+  "weights": "https://drive.google.com/uc?id=1mw-gU0afQtTQ8GgOoE2SexBAkPaFCjTT",
+  "disabled_reason": "InterFormer bridge/env is prepared, but the 4.1 GB checkpoint download and validation are not finished yet on this machine.",
+  "required_paths": [
+    "{repo_root}/.method_envs/interformer/bin/python",
+    "{repo_root}/.external_sources/interformer",
+    "{repo_root}/.external_sources/interformer/mmsegmentation",
+    "{repo_root}/.external_sources/interformer/work_dirs/interformer_tiny_coco_lvis_320k/interformer_tiny_coco_lvis_320k.py",
+    "{repo_root}/interactive_benchmark/runners/interformer_runner.py"
+  ],
+  "runtime": {
+    "cwd": "{repo_root}",
+    "env": {
+      "PYTHONPATH": "{repo_root}/.external_sources/interformer:{repo_root}/.external_sources/interformer/mmsegmentation"
+    }
+  },
+  "inference": {
+    "config_path": "{repo_root}/.external_sources/interformer/work_dirs/interformer_tiny_coco_lvis_320k/interformer_tiny_coco_lvis_320k.py",
+    "checkpoint_path": "{repo_root}/.external_sources/interformer/work_dirs/interformer_tiny_coco_lvis_320k/iter_320000.pth",
+    "device": "cpu",
+    "size_divisor": 32,
+    "inner_radius": 5,
+    "outer_radius": 0
+  },
+  "entrypoint": {
+    "command": [
+      "{repo_root}/.method_envs/interformer/bin/python",
+      "{repo_root}/interactive_benchmark/runners/interformer_runner.py",
+      "--input-json",
+      "{input_json}",
+      "--output-json",
+      "{output_json}"
+    ]
+  }
+}

@@ -14,6 +14,8 @@
 - [Семейства прогонов](run_families.md)
 - [Сводка результатов](results_digest.md)
 - [Хранилище и очистка](storage_and_cleanup.md)
+- [Geology Shortlist](geology_shortlist.md)
+- [Bring-Up External Methods](generated/external_methods_bringup_status.md)
 
 ## Зоны репозитория
 

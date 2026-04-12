@@ -2296,6 +2296,27 @@ def setup_logger(out_dir: Path, name: str = "eval") -> logging.Logger:
     return log
 
 
+# Shared benchmark primitives live in interactive_benchmark so the legacy
+# pipeline and the new benchmark layer reuse the same metric/oracle behavior.
+from interactive_benchmark.legacy_oracle import (  # noqa: E402
+    LargestBadRegionGenerator as _SharedLargestBadRegionGenerator,
+    parse_region_selection_cycle as _shared_parse_region_selection_cycle,
+)
+from interactive_benchmark.shared import (  # noqa: E402
+    StepMetrics as _SharedStepMetrics,
+    compute_ious as _shared_compute_ious,
+    plot_metrics as _shared_plot_metrics,
+    save_batch_summary as _shared_save_batch_summary,
+)
+
+StepMetrics = _SharedStepMetrics
+compute_ious = _shared_compute_ious
+LargestBadRegionGenerator = _SharedLargestBadRegionGenerator
+parse_region_selection_cycle = _shared_parse_region_selection_cycle
+plot_metrics = _shared_plot_metrics
+save_batch_summary = _shared_save_batch_summary
+
+
 # ─────────────────────────────────────────────────────────────────────────────────
 #  Аргументы
 # ─────────────────────────────────────────────────────────────────────────────────

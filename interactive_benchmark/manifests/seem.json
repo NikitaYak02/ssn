@@ -1,0 +1,17 @@
+{
+  "method_id": "seem",
+  "display_name": "SEEM",
+  "prompt_type": "scribble",
+  "paper_url": "https://arxiv.org/abs/2304.06718",
+  "repo_url": "https://github.com/UX-Decoder/Segment-Everything-Everywhere-All-At-Once",
+  "commit": "7b2e76dbb17d0b7831c6813a921fe2bc8de22926",
+  "weights": "https://huggingface.co/xdecoder/SEEM/resolve/main/seem_focalt_v2.pt",
+  "disabled_reason": "Official SEEM demo targets Linux/CUDA and detectron2-based runtime; Apple Silicon bring-up is not yet automated in this repository.",
+  "runtime": {
+    "cwd": "",
+    "env": {}
+  },
+  "entrypoint": {
+    "command": []
+  }
+}
