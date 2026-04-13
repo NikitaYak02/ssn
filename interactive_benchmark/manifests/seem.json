@@ -6,12 +6,22 @@
   "repo_url": "https://github.com/UX-Decoder/Segment-Everything-Everywhere-All-At-Once",
   "commit": "7b2e76dbb17d0b7831c6813a921fe2bc8de22926",
   "weights": "https://huggingface.co/xdecoder/SEEM/resolve/main/seem_focalt_v2.pt",
-  "disabled_reason": "Official SEEM demo targets Linux/CUDA and detectron2-based runtime; Apple Silicon bring-up is not yet automated in this repository.",
+  "required_paths": [
+    "{repo_root}/.venv/bin/python",
+    "{repo_root}/interactive_benchmark/runners/seem_runner.py"
+  ],
   "runtime": {
-    "cwd": "",
+    "cwd": "{repo_root}",
     "env": {}
   },
   "entrypoint": {
-    "command": []
+    "command": [
+      "{repo_root}/.venv/bin/python",
+      "{repo_root}/interactive_benchmark/runners/seem_runner.py",
+      "--input-json",
+      "{input_json}",
+      "--output-json",
+      "{output_json}"
+    ]
   }
 }

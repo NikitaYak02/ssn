@@ -6,12 +6,22 @@
   "repo_url": "https://github.com/UX-Decoder/Semantic-SAM",
   "commit": "e11f8b518539faea731e2744cc3e44c24572e30d",
   "weights": "https://github.com/UX-Decoder/Semantic-SAM/releases/download/checkpoint/swint_only_sam_many2many.pth",
-  "disabled_reason": "Official Semantic-SAM install path requires detectron2-based stack with CUDA-oriented dependencies; local Apple Silicon automation is not completed yet.",
+  "required_paths": [
+    "{repo_root}/.venv/bin/python",
+    "{repo_root}/interactive_benchmark/runners/semantic_sam_runner.py"
+  ],
   "runtime": {
-    "cwd": "",
+    "cwd": "{repo_root}",
     "env": {}
   },
   "entrypoint": {
-    "command": []
+    "command": [
+      "{repo_root}/.venv/bin/python",
+      "{repo_root}/interactive_benchmark/runners/semantic_sam_runner.py",
+      "--input-json",
+      "{input_json}",
+      "--output-json",
+      "{output_json}"
+    ]
   }
 }

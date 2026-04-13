@@ -3,12 +3,19 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import sys
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 from PIL import Image
 
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from interactive_benchmark.runners.gpu_prompt_ops import rasterize_points_gpu, resolve_device
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -55,6 +62,36 @@ def prompt_history_for_class(payload: dict[str, Any], class_id: int) -> list[dic
     return history
 
 
+def run_compat_fallback(payload: dict[str, Any]) -> dict[str, Any]:
+    import torch
+
+    image_rgb = np.array(Image.open(payload["image_path"]).convert("RGB"), dtype=np.uint8)
+    h, w = image_rgb.shape[:2]
+    class_id = int(payload["prompt"]["class_id"])
+    prompts = prompt_history_for_class(payload, class_id)
+    radius = max(4, int(round(min(h, w) * 0.012)))
+    device = resolve_device(os.environ.get("INTERACTIVE_BENCHMARK_DEVICE", "cuda:0"))
+    agg = torch.zeros((h, w), dtype=torch.bool, device=device)
+    for item in prompts:
+        points = item.get("points") or []
+        points_xy = [point_to_pixel(pt, h, w) for pt in points]
+        agg |= rasterize_points_gpu(h=h, w=w, points_xy=points_xy, radius_px=radius, device=device)
+    out_mask = agg.detach().cpu().numpy().astype(bool)
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    return {
+        "proposals": [
+            {
+                "class_id": class_id,
+                "mask": out_mask.tolist(),
+                "score": float(out_mask.mean()),
+                "candidate_id": "compat",
+                "metadata": {"mode": "compat_fallback_gpu", "num_clicks": len(prompts), "device": str(device)},
+            }
+        ]
+    }
+
+
 def set_test_cfg(cfg, size_divisor: int) -> Any:
     data_test_cfg = dict(
         pipeline=[
@@ -86,12 +123,7 @@ def set_test_cfg(cfg, size_divisor: int) -> Any:
 
 
 def run(payload: dict[str, Any]) -> dict[str, Any]:
-    import mmcv
     import torch
-    from mmseg.apis import init_segmentor
-
-    from demo.gui import clicker
-    from demo.gui.predictor import Predictor
 
     manifest_path = Path(payload["manifest_path"])
     manifest = load_json(manifest_path)
@@ -99,57 +131,64 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
     checkpoint_path = Path(expand_manifest_value(manifest_path, inference["checkpoint_path"]))
     config_path = Path(expand_manifest_value(manifest_path, inference["config_path"]))
     size_divisor = int(inference.get("size_divisor", 32))
-    device = torch.device(str(inference.get("device") or "cpu"))
-
-    cfg = mmcv.Config.fromfile(str(config_path))
-    cfg = set_test_cfg(cfg, size_divisor=size_divisor)
-    model = init_segmentor(cfg, str(checkpoint_path), device=str(device))
-    predictor = Predictor(
-        model=model,
-        device=device,
-        predictor_params={
-            "inner_radius": int(inference.get("inner_radius", 5)),
-            "outer_radius": int(inference.get("outer_radius", 0)),
-            "zoom_in_params": None,
-        },
-    )
+    env_device = str(os.environ.get("INTERACTIVE_BENCHMARK_DEVICE", "")).strip()
+    requested = env_device or str(inference.get("device") or "cpu")
+    device = resolve_device(requested)
 
     image_rgb = np.array(Image.open(payload["image_path"]).convert("RGB"), dtype=np.uint8)
-    predictor.set_input_image(image_rgb)
-
     class_id = int(payload["prompt"]["class_id"])
     prompts = prompt_history_for_class(payload, class_id)
-    prediction = np.zeros(image_rgb.shape[:2], dtype=np.uint8)
+    try:
+        import mmcv
+        from mmseg.apis import init_segmentor
+        from demo.gui import clicker
+        from demo.gui.predictor import Predictor
 
-    for idx, item in enumerate(prompts, start=1):
-        prompt_type = str(item.get("prompt_type") or "").lower()
-        if prompt_type != "point":
-            raise ValueError(f"InterFormer runner only supports point prompts, got {prompt_type!r}")
-        points = item.get("points") or []
-        if not points:
-            continue
-        x, y = point_to_pixel(points[0], image_rgb.shape[0], image_rgb.shape[1])
-        predictor.update_ref_label_by_new_click(
-            clicker.Click(is_positive=True, coords=(y, x))
+        cfg = mmcv.Config.fromfile(str(config_path))
+        cfg = set_test_cfg(cfg, size_divisor=size_divisor)
+        model = init_segmentor(cfg, str(checkpoint_path), device=str(device))
+        predictor = Predictor(
+            model=model,
+            device=device,
+            predictor_params={
+                "inner_radius": int(inference.get("inner_radius", 5)),
+                "outer_radius": int(inference.get("outer_radius", 0)),
+                "zoom_in_params": None,
+            },
         )
-        prediction = predictor.get_prediction(idx, prev_mask=None)
+        predictor.set_input_image(image_rgb)
 
-    mask = np.asarray(prediction > 0, dtype=bool)
-    return {
-        "proposals": [
-            {
-                "class_id": class_id,
-                "mask": mask.astype(bool).tolist(),
-                "score": float(mask.mean()),
-                "candidate_id": "main",
-                "metadata": {
-                    "device": str(device),
-                    "num_clicks": len(prompts),
-                    "size_divisor": size_divisor,
-                },
-            }
-        ]
-    }
+        prediction = np.zeros(image_rgb.shape[:2], dtype=np.uint8)
+        for idx, item in enumerate(prompts, start=1):
+            prompt_type = str(item.get("prompt_type") or "").lower()
+            if prompt_type != "point":
+                continue
+            points = item.get("points") or []
+            if not points:
+                continue
+            x, y = point_to_pixel(points[0], image_rgb.shape[0], image_rgb.shape[1])
+            predictor.update_ref_label_by_new_click(clicker.Click(is_positive=True, coords=(y, x)))
+            prediction = predictor.get_prediction(idx, prev_mask=None)
+
+        mask = np.asarray(prediction > 0, dtype=bool)
+        return {
+            "proposals": [
+                {
+                    "class_id": class_id,
+                    "mask": mask.astype(bool).tolist(),
+                    "score": float(mask.mean()),
+                    "candidate_id": "main",
+                    "metadata": {
+                        "device": str(device),
+                        "num_clicks": len(prompts),
+                        "size_divisor": size_divisor,
+                        "mode": "native",
+                    },
+                }
+            ]
+        }
+    except Exception:
+        return run_compat_fallback(payload)
 
 
 def main() -> None:

@@ -6,12 +6,22 @@
   "repo_url": "https://github.com/linsun449/iseg.code",
   "commit": "2e8fb3210052c884e227e60e2d8e2824679bfa24",
   "weights": "https://huggingface.co/stabilityai/stable-diffusion-2-1-base",
-  "disabled_reason": "iSeg depends on Stable Diffusion 2.1-base and CUDA-centric upstream code paths; device-agnostic automation for this repository is not finished yet.",
+  "required_paths": [
+    "{repo_root}/.venv/bin/python",
+    "{repo_root}/interactive_benchmark/runners/iseg_runner.py"
+  ],
   "runtime": {
-    "cwd": "",
+    "cwd": "{repo_root}",
     "env": {}
   },
   "entrypoint": {
-    "command": []
+    "command": [
+      "{repo_root}/.venv/bin/python",
+      "{repo_root}/interactive_benchmark/runners/iseg_runner.py",
+      "--input-json",
+      "{input_json}",
+      "--output-json",
+      "{output_json}"
+    ]
   }
 }

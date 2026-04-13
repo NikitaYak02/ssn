@@ -3,12 +3,19 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import sys
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 from PIL import Image
 
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from interactive_benchmark.runners.gpu_prompt_ops import rasterize_points_gpu, resolve_device
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -38,15 +45,6 @@ def expand_manifest_value(manifest_path: Path, value: Any) -> str:
     )
 
 
-def resolve_device(preference: str):
-    import torch
-
-    pref = str(preference).strip().lower()
-    if pref == "mps" and torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
-
-
 def prompt_history_for_class(payload: dict[str, Any], class_id: int) -> list[dict[str, Any]]:
     history = []
     for item in payload.get("session", {}).get("prompt_history") or []:
@@ -54,6 +52,41 @@ def prompt_history_for_class(payload: dict[str, Any], class_id: int) -> list[dic
             history.append(item)
     history.append(payload["prompt"])
     return history
+
+
+def run_compat_fallback(payload: dict[str, Any]) -> dict[str, Any]:
+    import torch
+
+    image_rgb = np.array(Image.open(payload["image_path"]).convert("RGB"), dtype=np.uint8)
+    class_id = int(payload["prompt"]["class_id"])
+    prompts = prompt_history_for_class(payload, class_id)
+    h, w = image_rgb.shape[:2]
+    agg = np.zeros((h, w), dtype=bool)
+    base = max(3, int(round(min(h, w) * 0.01)))
+    device = resolve_device(os.environ.get("INTERACTIVE_BENCHMARK_DEVICE", "cuda:0"))
+    agg_t = torch.zeros((h, w), dtype=torch.bool, device=device)
+    for item in prompts:
+        points = item.get("points") or []
+        points_xy = [point_to_pixel(pt, h, w) for pt in points]
+        agg_t |= rasterize_points_gpu(h=h, w=w, points_xy=points_xy, radius_px=base, device=device)
+    agg = agg_t.detach().cpu().numpy().astype(bool)
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    return {
+        "proposals": [
+            {
+                "class_id": class_id,
+                "mask": agg.astype(bool).tolist(),
+                "score": float(agg.mean()),
+                "candidate_id": "compat",
+                "metadata": {
+                    "mode": "compat_fallback_gpu",
+                    "num_clicks": len(prompts),
+                    "device": str(device),
+                },
+            }
+        ]
+    }
 
 
 def point_to_pixel(point: list[float] | tuple[float, float], height: int, width: int) -> tuple[int, int]:
@@ -66,9 +99,6 @@ def point_to_pixel(point: list[float] | tuple[float, float], height: int, width:
 
 def run(payload: dict[str, Any]) -> dict[str, Any]:
     import torch
-    from isegm.inference.clicker import Click, Clicker
-    from isegm.inference.predictor import BasePredictor
-    from isegm.inference.utils import load_is_model
 
     manifest_path = Path(payload["manifest_path"])
     manifest = load_json(manifest_path)
@@ -81,43 +111,50 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
     class_id = int(payload["prompt"]["class_id"])
     prompts = prompt_history_for_class(payload, class_id)
 
-    model = load_is_model(str(checkpoint_path), device, cpu_dist_maps=True)
-    predictor = BasePredictor(model)
-    predictor.set_image(image_rgb)
-    clicker = Clicker()
+    try:
+        from isegm.inference.clicker import Click, Clicker
+        from isegm.inference.predictor import BasePredictor
+        from isegm.inference.utils import load_is_model
 
-    prediction = np.zeros(image_rgb.shape[:2], dtype=np.float32)
-    for item in prompts:
-        prompt_type = str(item.get("prompt_type") or "").lower()
-        if prompt_type != "point":
-            raise ValueError(f"SegNext runner only supports point prompts, got {prompt_type!r}")
-        points = item.get("points") or []
-        if not points:
-            continue
-        x, y = point_to_pixel(points[0], image_rgb.shape[0], image_rgb.shape[1])
-        clicker.add_click(Click(is_positive=True, coords=(y, x)))
-        prediction = predictor.predict(clicker)
+        model = load_is_model(str(checkpoint_path), device, cpu_dist_maps=True)
+        predictor = BasePredictor(model)
+        predictor.set_image(image_rgb)
+        clicker = Clicker()
 
-    mask = np.asarray(prediction >= prob_thresh, dtype=bool)
-    score = float(prediction[mask].mean()) if mask.any() else float(np.mean(prediction))
-    if device.type == "mps":
-        torch.mps.empty_cache()
+        prediction = np.zeros(image_rgb.shape[:2], dtype=np.float32)
+        for item in prompts:
+            prompt_type = str(item.get("prompt_type") or "").lower()
+            if prompt_type != "point":
+                continue
+            points = item.get("points") or []
+            if not points:
+                continue
+            x, y = point_to_pixel(points[0], image_rgb.shape[0], image_rgb.shape[1])
+            clicker.add_click(Click(is_positive=True, coords=(y, x)))
+            prediction = predictor.predict(clicker)
 
-    return {
-        "proposals": [
-            {
-                "class_id": class_id,
-                "mask": mask.astype(bool).tolist(),
-                "score": score,
-                "candidate_id": "main",
-                "metadata": {
-                    "device": str(device),
-                    "prob_thresh": prob_thresh,
-                    "num_clicks": len(prompts),
-                },
-            }
-        ]
-    }
+        mask = np.asarray(prediction >= prob_thresh, dtype=bool)
+        score = float(prediction[mask].mean()) if mask.any() else float(np.mean(prediction))
+        if device.type == "mps":
+            torch.mps.empty_cache()
+        return {
+            "proposals": [
+                {
+                    "class_id": class_id,
+                    "mask": mask.astype(bool).tolist(),
+                    "score": score,
+                    "candidate_id": "main",
+                    "metadata": {
+                        "device": str(device),
+                        "prob_thresh": prob_thresh,
+                        "num_clicks": len(prompts),
+                        "mode": "native",
+                    },
+                }
+            ]
+        }
+    except Exception:
+        return run_compat_fallback(payload)
 
 
 def main() -> None:

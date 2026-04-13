@@ -248,7 +248,7 @@ def update_param(inputs, labels_u8, coords_cache,
     if profiler:
         profiler.start('forward_pass')
     # AMP forward pass (float16 conv/BN for speed)
-    with torch.amp.autocast('cuda', enabled=(device == 'cuda')):
+    with torch.amp.autocast('cuda', enabled=(device.type == 'cuda')):
         Q, H, _ = model(model_input)
     if profiler:
         profiler.end()
@@ -300,13 +300,16 @@ def update_param(inputs, labels_u8, coords_cache,
 # ── main training loop ─────────────────────────────────────────────────────────
 
 def train(cfg):
-    device = get_torch_device(torch)
-    use_amp = (device == "cuda")
+    if getattr(cfg, "device", None):
+        device = torch.device(cfg.device)
+    else:
+        device = torch.device(get_torch_device(torch))
+    use_amp = device.type == "cuda"
 
     model = SSNModel(cfg.fdim, cfg.nspix, cfg.niter).to(device)
 
     # torch.compile gives 10-30% extra speed on PyTorch ≥ 2.0 for free
-    if device != "mps" and hasattr(torch, 'compile'):
+    if device.type != "mps" and hasattr(torch, 'compile'):
         try:
             model = torch.compile(model)
             print("torch.compile enabled")
@@ -314,7 +317,7 @@ def train(cfg):
             pass   # older GPU / driver — just continue without compile
 
     optimizer = optim.Adam(model.parameters(), cfg.lr)
-    scaler = torch.amp.GradScaler('cuda') if use_amp else None
+    scaler = torch.amp.GradScaler("cuda") if use_amp else None
 
     # ── dataset ────────────────────────────────────────────────────────────────
     # Use Albumentations for 2-3x faster augmentation
@@ -336,7 +339,7 @@ def train(cfg):
     # With data in RAM the worker bottleneck is augmentation (cv2.resize),
     # not I/O.  persistent_workers avoids re-forking every epoch.
     _dl_kwargs = dict(
-        pin_memory=(device == "cuda"),
+        pin_memory=(device.type == "cuda"),
         persistent_workers=(cfg.nworkers > 0),
     )
     train_loader = DataLoader(
@@ -352,7 +355,7 @@ def train(cfg):
     # ── info ───────────────────────────────────────────────────────────────────
     print(f"Train: {len(train_dataset)} samples  |  "
           f"Val: {len(val_dataset)} samples")
-    print(f"Device: {device}  |  AMP: {use_amp}  |  "
+    print(f"Device: {str(device)}  |  AMP: {use_amp}  |  "
           f"Workers: {cfg.nworkers}")
     print(f"nspix={cfg.nspix}  fdim={cfg.fdim}  niter={cfg.niter}  "
           f"crop={cfg.crop_size}")
@@ -463,6 +466,13 @@ if __name__ == "__main__":
     # Output
     parser.add_argument("--out_dir", default="./log",
                         help="Checkpoint output directory")
+
+    # Device (default: cuda > mps > cpu via get_torch_device)
+    parser.add_argument(
+        "--device",
+        default=None,
+        help='Torch device, e.g. "cuda:2". Default: auto-select.',
+    )
 
     # Training
     parser.add_argument("--batchsize",   default=6,      type=int)

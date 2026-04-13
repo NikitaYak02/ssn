@@ -3,8 +3,8 @@ from __future__ import annotations
 import json
 import os
 import shutil
-import subprocess
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -12,6 +12,7 @@ import numpy as np
 from PIL import Image, ImageDraw
 
 from .contracts import MaskProposal, MethodAdapter, PromptPayload
+from .resource_monitor import run_monitored_command
 from .session import SessionState
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -52,6 +53,7 @@ class MockGeometryAdapter(MethodAdapter):
         self.method_id = method_id
         self.display_name = display_name
         self.prompt_type = prompt_type
+        self.last_resource_metrics: dict[str, Any] | None = None
 
     def is_available(self) -> tuple[bool, Optional[str]]:
         return True, None
@@ -63,6 +65,7 @@ class MockGeometryAdapter(MethodAdapter):
         prompt: PromptPayload,
         work_dir: Path,
     ) -> list[MaskProposal]:
+        start = time.perf_counter()
         h, w = image_rgb.shape[:2]
         scale = max(2, int(round(min(h, w) * 0.08)))
         if self.prompt_type == "point":
@@ -71,7 +74,7 @@ class MockGeometryAdapter(MethodAdapter):
             mask = _rasterize_polyline_mask((h, w), prompt.points, width_px=max(2, scale // 2))
         else:
             mask = _rasterize_polyline_mask((h, w), prompt.points, width_px=max(3, scale))
-        return [
+        proposals = [
             MaskProposal(
                 class_id=int(prompt.class_id),
                 mask=mask,
@@ -80,6 +83,13 @@ class MockGeometryAdapter(MethodAdapter):
                 candidate_id=f"{self.method_id}_default",
             )
         ]
+        self.last_resource_metrics = {
+            "wall_time_sec": float(time.perf_counter() - start),
+            "peak_rss_bytes": 0,
+            "peak_gpu_memory_mib": 0,
+            "memory_limit_exceeded": 0,
+        }
+        return proposals
 
 
 class ExternalSubprocessAdapter(MethodAdapter):
@@ -90,6 +100,7 @@ class ExternalSubprocessAdapter(MethodAdapter):
         self.method_id = str(self.manifest["method_id"])
         self.display_name = str(self.manifest.get("display_name") or self.method_id)
         self.prompt_type = str(self.manifest["prompt_type"])
+        self.last_resource_metrics: dict[str, Any] | None = None
 
     def _expand_string(self, value: Any) -> str:
         text = str(value)
@@ -193,6 +204,7 @@ class ExternalSubprocessAdapter(MethodAdapter):
         prompt: PromptPayload,
         work_dir: Path,
     ) -> list[MaskProposal]:
+        self.last_resource_metrics = None
         available, reason = self.is_available()
         if not available:
             raise RuntimeError(reason or f"{self.method_id} is unavailable")
@@ -219,12 +231,11 @@ class ExternalSubprocessAdapter(MethodAdapter):
             }
             runtime_cwd = runtime.get("cwd")
             resolved_cwd = self._resolve_path_value(runtime_cwd) if runtime_cwd else work_dir
-            proc = subprocess.run(
+            proc = run_monitored_command(
                 command,
                 cwd=str(resolved_cwd),
                 env=None if not env else {**os.environ, **env},
-                capture_output=True,
-                text=True,
+                memory_limit_gb=getattr(self, "memory_limit_gb", None),
             )
             if proc.returncode != 0:
                 raise RuntimeError(
@@ -234,6 +245,12 @@ class ExternalSubprocessAdapter(MethodAdapter):
                 )
             with open(output_path, "r", encoding="utf-8") as fh:
                 payload = json.load(fh)
+            self.last_resource_metrics = {
+                "wall_time_sec": float(proc.usage.wall_time_sec),
+                "peak_rss_bytes": int(proc.usage.peak_rss_bytes),
+                "peak_gpu_memory_mib": int(proc.usage.peak_gpu_memory_mib),
+                "memory_limit_exceeded": int(bool(proc.usage.memory_limit_exceeded)),
+            }
         proposals: list[MaskProposal] = []
         for idx, item in enumerate(payload.get("proposals") or []):
             proposals.append(

@@ -51,6 +51,13 @@ def load_mask_as_ids(mask_path: Path) -> np.ndarray:
     return arr.astype(np.int32)
 
 
+def save_label_mask(path: Path, labels: np.ndarray) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    arr = np.asarray(labels, dtype=np.int32)
+    arr = np.where(arr < 0, 0, arr).astype(np.uint16)
+    Image.fromarray(arr, mode="I;16").save(path)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Unified benchmark for current scribble pipeline and external interactive methods."
@@ -94,6 +101,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--fail-on-unavailable",
         action="store_true",
         help="Fail instead of skipping unavailable external methods.",
+    )
+    parser.add_argument(
+        "--memory-limit-gb",
+        type=float,
+        default=50.0,
+        help="Per-method process RSS watchdog limit in GB.",
+    )
+    parser.add_argument(
+        "--device-tag",
+        default=None,
+        help="Optional tag for device/run partition in output tables.",
     )
     return parser
 
@@ -207,6 +225,61 @@ def summarize_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return summary_rows
 
 
+def summarize_resource_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for row in rows:
+        key = (str(row["method_id"]), str(row.get("device_tag") or "unspecified"))
+        grouped.setdefault(key, []).append(row)
+
+    summary_rows: list[dict[str, Any]] = []
+    for (method_id, device_tag), bucket in sorted(grouped.items(), key=lambda item: (item[0][0], item[0][1])):
+        ok_rows = [row for row in bucket if str(row.get("status")) == "ok"]
+        sample = bucket[0]
+        row = {
+            "method_id": method_id,
+            "display_name": str(sample.get("display_name") or method_id),
+            "prompt_type": str(sample.get("prompt_type") or ""),
+            "device_tag": device_tag,
+            "n_steps": int(len(bucket)),
+            "n_steps_ok": int(len(ok_rows)),
+        }
+        if ok_rows:
+            row.update(
+                {
+                    "mean_wall_time_sec": float(np.mean([float(item["wall_time_sec"]) for item in ok_rows])),
+                    "max_wall_time_sec": float(np.max([float(item["wall_time_sec"]) for item in ok_rows])),
+                    "mean_peak_rss_bytes": float(np.mean([float(item["peak_rss_bytes"]) for item in ok_rows])),
+                    "max_peak_rss_bytes": float(np.max([float(item["peak_rss_bytes"]) for item in ok_rows])),
+                    "mean_peak_gpu_memory_mib": float(
+                        np.mean([float(item["peak_gpu_memory_mib"]) for item in ok_rows])
+                    ),
+                    "max_peak_gpu_memory_mib": float(
+                        np.max([float(item["peak_gpu_memory_mib"]) for item in ok_rows])
+                    ),
+                    "memory_limit_exceeded_count": int(
+                        sum(int(item.get("memory_limit_exceeded") or 0) for item in ok_rows)
+                    ),
+                    "status": "ok",
+                }
+            )
+        else:
+            row.update(
+                {
+                    "mean_wall_time_sec": float("nan"),
+                    "max_wall_time_sec": float("nan"),
+                    "mean_peak_rss_bytes": float("nan"),
+                    "max_peak_rss_bytes": float("nan"),
+                    "mean_peak_gpu_memory_mib": float("nan"),
+                    "max_peak_gpu_memory_mib": float("nan"),
+                    "memory_limit_exceeded_count": 0,
+                    "status": str(sample.get("status") or "failed"),
+                    "error": sample.get("error"),
+                }
+            )
+        summary_rows.append(row)
+    return summary_rows
+
+
 def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if not rows:
@@ -266,7 +339,7 @@ def run_adapter_on_pair(
     interaction_budgets: list[int],
     args: argparse.Namespace,
     output_dir: Path,
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     image_rgb = np.array(Image.open(image_path).convert("RGB"), dtype=np.uint8)
     gt_mask = load_mask_as_ids(mask_path)
     if gt_mask.shape[:2] != image_rgb.shape[:2]:
@@ -300,6 +373,7 @@ def run_adapter_on_pair(
     budget_set = set(int(item) for item in interaction_budgets)
     max_budget = max(budget_set)
     rows: list[dict[str, Any]] = []
+    resource_rows: list[dict[str, Any]] = []
 
     for interaction_id in range(1, max_budget + 1):
         prev_pred = session.canvas.labels
@@ -322,6 +396,22 @@ def run_adapter_on_pair(
 
         step_dir = output_dir / image_path.stem / adapter.method_id / f"step_{interaction_id:03d}"
         proposals = adapter.predict(image_rgb, session, prompt, step_dir)
+        resource = dict(getattr(adapter, "last_resource_metrics", None) or {})
+        resource_rows.append(
+            {
+                "image": image_path.stem,
+                "method_id": adapter.method_id,
+                "display_name": adapter.display_name,
+                "prompt_type": adapter.prompt_type,
+                "interaction_id": int(interaction_id),
+                "wall_time_sec": float(resource.get("wall_time_sec", float("nan"))),
+                "peak_rss_bytes": int(resource.get("peak_rss_bytes", 0)),
+                "peak_gpu_memory_mib": int(resource.get("peak_gpu_memory_mib", 0)),
+                "memory_limit_exceeded": int(resource.get("memory_limit_exceeded", 0)),
+                "status": "ok",
+                "device_tag": str(args.device_tag or "unspecified"),
+            }
+        )
         chosen = choose_best_proposal(proposals, selection.target_mask)
         session.apply_proposal(chosen, interaction_id=interaction_id, prompt=prompt)
 
@@ -363,10 +453,17 @@ def run_adapter_on_pair(
                     extra={
                         "selected_candidate": chosen.candidate_id,
                         "num_candidates": len(proposals),
+                        "wall_time_sec": float(resource.get("wall_time_sec", float("nan"))),
+                        "peak_rss_bytes": int(resource.get("peak_rss_bytes", 0)),
+                        "peak_gpu_memory_mib": int(resource.get("peak_gpu_memory_mib", 0)),
+                        "memory_limit_exceeded": int(resource.get("memory_limit_exceeded", 0)),
+                        "device_tag": str(args.device_tag or "unspecified"),
                     },
                 )
             )
-    return rows
+    final_mask_path = output_dir / image_path.stem / adapter.method_id / "final_mask.png"
+    save_label_mask(final_mask_path, session.canvas.labels)
+    return rows, resource_rows
 
 
 def main() -> None:
@@ -381,6 +478,7 @@ def main() -> None:
     current_pipeline_args = parse_json_value(args.current_pipeline_args) or {}
 
     all_rows: list[dict[str, Any]] = []
+    resource_rows: list[dict[str, Any]] = []
     unavailable_methods: list[dict[str, Any]] = []
 
     for method_id in methods:
@@ -410,7 +508,25 @@ def main() -> None:
                     interaction_budgets=interaction_budgets,
                     pipeline_args=current_pipeline_args,
                     python_bin=args.python_bin,
+                    memory_limit_gb=args.memory_limit_gb,
                 )
+                for row in rows:
+                    row["device_tag"] = str(args.device_tag or "unspecified")
+                    resource_rows.append(
+                        {
+                            "image": str(row["image"]),
+                            "method_id": "current_pipeline",
+                            "display_name": "Current Pipeline",
+                            "prompt_type": "scribble",
+                            "interaction_id": int(row["interaction_budget"]),
+                            "wall_time_sec": float(row.get("run_wall_time_sec", float("nan"))),
+                            "peak_rss_bytes": int(row.get("run_peak_rss_bytes", 0)),
+                            "peak_gpu_memory_mib": int(row.get("run_peak_gpu_memory_mib", 0)),
+                            "memory_limit_exceeded": int(row.get("run_memory_limit_exceeded", 0)),
+                            "status": "ok",
+                            "device_tag": str(args.device_tag or "unspecified"),
+                        }
+                    )
                 all_rows.extend(rows)
             except Exception as exc:
                 for budget in interaction_budgets:
@@ -423,6 +539,19 @@ def main() -> None:
                             "interaction_budget": int(budget),
                             "status": "failed",
                             "error": str(exc),
+                            "device_tag": str(args.device_tag or "unspecified"),
+                        }
+                    )
+                    resource_rows.append(
+                        {
+                            "image": image_path.stem,
+                            "method_id": "current_pipeline",
+                            "display_name": "Current Pipeline",
+                            "prompt_type": "scribble",
+                            "interaction_id": int(budget),
+                            "status": "failed",
+                            "error": str(exc),
+                            "device_tag": str(args.device_tag or "unspecified"),
                         }
                     )
 
@@ -430,6 +559,7 @@ def main() -> None:
             if method_id == "current_pipeline":
                 continue
             adapter = create_adapter(method_id)
+            setattr(adapter, "memory_limit_gb", args.memory_limit_gb)
             available, reason = adapter.is_available()
             if not available:
                 for budget in interaction_budgets:
@@ -442,11 +572,24 @@ def main() -> None:
                             "interaction_budget": int(budget),
                             "status": "skipped",
                             "error": reason,
+                            "device_tag": str(args.device_tag or "unspecified"),
+                        }
+                    )
+                    resource_rows.append(
+                        {
+                            "image": image_path.stem,
+                            "method_id": adapter.method_id,
+                            "display_name": adapter.display_name,
+                            "prompt_type": adapter.prompt_type,
+                            "interaction_id": int(budget),
+                            "status": "skipped",
+                            "error": reason,
+                            "device_tag": str(args.device_tag or "unspecified"),
                         }
                     )
                 continue
             try:
-                rows = run_adapter_on_pair(
+                rows, run_resources = run_adapter_on_pair(
                     adapter=adapter,
                     image_path=image_path,
                     mask_path=mask_path,
@@ -455,6 +598,7 @@ def main() -> None:
                     output_dir=output_dir / "runs",
                 )
                 all_rows.extend(rows)
+                resource_rows.extend(run_resources)
             except Exception as exc:
                 for budget in interaction_budgets:
                     all_rows.append(
@@ -466,6 +610,19 @@ def main() -> None:
                             "interaction_budget": int(budget),
                             "status": "failed",
                             "error": str(exc),
+                            "device_tag": str(args.device_tag or "unspecified"),
+                        }
+                    )
+                    resource_rows.append(
+                        {
+                            "image": image_path.stem,
+                            "method_id": adapter.method_id,
+                            "display_name": adapter.display_name,
+                            "prompt_type": adapter.prompt_type,
+                            "interaction_id": int(budget),
+                            "status": "failed",
+                            "error": str(exc),
+                            "device_tag": str(args.device_tag or "unspecified"),
                         }
                     )
 
@@ -474,6 +631,8 @@ def main() -> None:
     summary_json = output_dir / "summary.json"
     leaderboard_md = output_dir / "leaderboard.md"
     plot_path = output_dir / "quality_vs_interactions.png"
+    resource_csv = output_dir / "resource_metrics.csv"
+    resource_summary_csv = output_dir / "resource_summary.csv"
 
     write_csv(per_step_csv, all_rows)
     summary_rows = summarize_rows(all_rows)
@@ -484,11 +643,16 @@ def main() -> None:
             "interaction_budgets": interaction_budgets,
             "pairs": [[str(img), str(mask)] for img, mask in pairs],
             "summary": summary_rows,
+            "resource_summary": summarize_resource_rows(resource_rows),
             "unavailable_methods": unavailable_methods,
+            "memory_limit_gb": args.memory_limit_gb,
+            "device_tag": str(args.device_tag or "unspecified"),
         },
     )
     plot_quality_vs_interactions(all_rows, plot_path)
     leaderboard_md.write_text(build_leaderboard(summary_rows, max(interaction_budgets)), encoding="utf-8")
+    write_csv(resource_csv, resource_rows)
+    write_csv(resource_summary_csv, summarize_resource_rows(resource_rows))
 
 
 if __name__ == "__main__":

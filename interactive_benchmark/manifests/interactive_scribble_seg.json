@@ -1,0 +1,37 @@
+{
+  "method_id": "interactive_scribble_seg",
+  "display_name": "Interactive Scribble Segmentation (MMLowes)",
+  "prompt_type": "scribble",
+  "repo_url": "https://github.com/MMLowes/Interactive-Scribble-Segmentation",
+  "required_paths": [
+    "{repo_root}/.venv/bin/python",
+    "{repo_root}/interactive_benchmark/runners/interactive_scribble_seg_runner.py",
+    "{repo_root}/.external_sources/Interactive-Scribble-Segmentation/model_unet.py",
+    "{repo_root}/.external_sources/Interactive-Scribble-Segmentation/config.py",
+    "{repo_root}/.external_sources/Interactive-Scribble-Segmentation/runs/amix_150000.pt"
+  ],
+  "runtime": {
+    "cwd": "{repo_root}",
+    "env": {}
+  },
+  "inference": {
+    "external_repo_path": "{repo_root}/.external_sources/Interactive-Scribble-Segmentation",
+    "checkpoint_path": "{repo_root}/.external_sources/Interactive-Scribble-Segmentation/runs/amix_150000.pt",
+    "model_name": "amix_150000",
+    "resize_size": 128,
+    "click_radius_px": 5,
+    "line_width_px": 5,
+    "device": "cuda:0",
+    "prob_thresh": 0.5
+  },
+  "entrypoint": {
+    "command": [
+      "{repo_root}/.venv/bin/python",
+      "{repo_root}/interactive_benchmark/runners/interactive_scribble_seg_runner.py",
+      "--input-json",
+      "{input_json}",
+      "--output-json",
+      "{output_json}"
+    ]
+  }
+}

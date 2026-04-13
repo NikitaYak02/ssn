@@ -791,11 +791,18 @@ def main() -> int:
         flush=True,
     )
 
+    python_bin_arg = Path(str(args.python_bin)).expanduser()
+    if python_bin_arg.exists():
+        # Preserve the provided path (including symlinks like `.venv/bin/python`).
+        python_bin = str(python_bin_arg.absolute())
+    else:
+        python_bin = str(args.python_bin)
+
     worker_args = {
         "image": resized_image,
         "mask": resized_mask,
         "output_dir": str(output_dir),
-        "python_bin": str(Path(args.python_bin).resolve() if Path(args.python_bin).exists() else args.python_bin),
+        "python_bin": python_bin,
         "scribbles": int(args.scribbles),
         "save_every": int(args.save_every),
         "seed": int(args.seed),

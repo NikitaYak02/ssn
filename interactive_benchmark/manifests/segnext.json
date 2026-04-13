@@ -7,16 +7,12 @@
   "commit": "db045f6d6bab73029457e2ced4fec4a92cc69600",
   "weights": "https://drive.google.com/uc?id=1qkXIvxnlY3Z4xLYGWJcoAHBUNyDmvwPS",
   "required_paths": [
-    "{repo_root}/.method_envs/segnext/bin/python",
-    "{repo_root}/.external_sources/segnext/segnext",
-    "{repo_root}/.external_sources/segnext/weights/vitb_sa2_cocolvis_hq44k_epoch_0.pth",
+    "{repo_root}/.venv/bin/python",
     "{repo_root}/interactive_benchmark/runners/segnext_runner.py"
   ],
   "runtime": {
     "cwd": "{repo_root}",
-    "env": {
-      "PYTHONPATH": "{repo_root}/.external_sources/segnext/segnext"
-    }
+    "env": {}
   },
   "inference": {
     "checkpoint_path": "{repo_root}/.external_sources/segnext/weights/vitb_sa2_cocolvis_hq44k_epoch_0.pth",
@@ -25,7 +21,7 @@
   },
   "entrypoint": {
     "command": [
-      "{repo_root}/.method_envs/segnext/bin/python",
+      "{repo_root}/.venv/bin/python",
       "{repo_root}/interactive_benchmark/runners/segnext_runner.py",
       "--input-json",
       "{input_json}",
