@@ -1,0 +1,43 @@
+[
+  {
+    "run_name": "s1v2_optimal4_s150_ds0p5_miougain_cuda3_p40_20260415_044214",
+    "path": "/home/n.yakovlev/ssn_final/ssn/artifacts/interactive_runs/s1v2_optimal4_s150_ds0p5_miougain_cuda3_p40_20260415_044214",
+    "created_at": "2026-04-15T04:42:14",
+    "scribbles": 150,
+    "downscale": 0.5,
+    "methods": [
+      {
+        "method": "felzenszwalb",
+        "n_ok": 20,
+        "n_failed": 0,
+        "miou_mean": 0.6152039499999999,
+        "miou_variance": 0.0110010181576475,
+        "miou_std": 0.10488573858083615
+      },
+      {
+        "method": "slic",
+        "n_ok": 20,
+        "n_failed": 0,
+        "miou_mean": 0.5686168500000001,
+        "miou_variance": 0.008665159242227497,
+        "miou_std": 0.09308683710507892
+      },
+      {
+        "method": "ssn",
+        "n_ok": 19,
+        "n_failed": 1,
+        "miou_mean": 0.5053882105263158,
+        "miou_variance": 0.012940064971218837,
+        "miou_std": 0.11375440638155006
+      },
+      {
+        "method": "watershed",
+        "n_ok": 20,
+        "n_failed": 0,
+        "miou_mean": 0.6262996499999999,
+        "miou_variance": 0.0101679386488275,
+        "miou_std": 0.10083619711605302
+      }
+    ]
+  }
+]

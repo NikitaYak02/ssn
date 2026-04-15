@@ -17,6 +17,7 @@
 - [Geology Shortlist](geology_shortlist.md)
 - [Bring-Up External Methods](generated/external_methods_bringup_status.md)
 - [Superpixel Anything Overlap](superpixel_anything_overlap.md)
+- [Finished Interactive Runs](experiments/interactive_runs_finished.md)
 
 ## Зоны репозитория
 
