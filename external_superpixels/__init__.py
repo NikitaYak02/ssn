@@ -5,21 +5,27 @@ from .paper_alignment import (
     compute_superpixel_anything_overlap,
 )
 from .spam import (
+    apply_spam_runtime_patches,
     bootstrap_spam_environment,
+    build_spam_runtime_env,
     build_spam_train_command,
     load_spam_manifest,
     prepare_bsd_like_dataset,
+    resolve_spam_device,
     resolve_spam_paths,
 )
 
 __all__ = [
     "REPO_SUPERPIXEL_METHODS",
     "SPAM_TRAINABLE_VARIANTS",
+    "apply_spam_runtime_patches",
     "bootstrap_spam_environment",
+    "build_spam_runtime_env",
     "build_spam_train_command",
     "build_superpixel_anything_overlap_report",
     "compute_superpixel_anything_overlap",
     "load_spam_manifest",
     "prepare_bsd_like_dataset",
+    "resolve_spam_device",
     "resolve_spam_paths",
 ]

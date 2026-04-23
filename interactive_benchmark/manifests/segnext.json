@@ -16,7 +16,7 @@
   },
   "inference": {
     "checkpoint_path": "{repo_root}/.external_sources/segnext/weights/vitb_sa2_cocolvis_hq44k_epoch_0.pth",
-    "device": "cpu",
+    "device": "auto",
     "prob_thresh": 0.5
   },
   "entrypoint": {

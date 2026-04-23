@@ -9,11 +9,14 @@ import scipy.io
 from PIL import Image
 import numpy as np
 
+import external_superpixels.spam as spam_module
 from external_superpixels.paper_alignment import compute_superpixel_anything_overlap
 from external_superpixels.spam import (
+    apply_spam_runtime_patches,
     build_spam_train_command,
     load_spam_manifest,
     prepare_bsd_like_dataset,
+    resolve_spam_device,
 )
 
 
@@ -78,6 +81,7 @@ def test_build_spam_train_command_uses_manifest_paths(tmp_path: Path) -> None:
         train_iter=123,
         type_model="resnet50",
         use_sam=True,
+        device="cpu",
     )
 
     assert cmd["cmd"][0] == str(venv_dir / "bin" / "python")
@@ -85,6 +89,53 @@ def test_build_spam_train_command_uses_manifest_paths(tmp_path: Path) -> None:
     assert "123" in cmd["cmd"]
     assert "--use_sam" in cmd["cmd"]
     assert cmd["cwd"] == str(repo_dir / "SPAM")
+    assert cmd["device"]["selected"] == "cpu"
+    assert cmd["runtime_env"]["env_overrides"]["SPAM_DEVICE"] == "cpu"
+    assert cmd["runtime_env"]["env_overrides"]["SPAM_FORCE_CPU_PAIRWISE"] == "1"
+    assert cmd["runtime_env"]["path_prefix"] == str((venv_dir / "bin").resolve())
+
+
+def test_resolve_spam_device_auto_prefers_cuda(monkeypatch) -> None:
+    monkeypatch.setattr(
+        spam_module,
+        "_probe_torch_capabilities",
+        lambda python_bin=None: {
+            "probe_python": "/tmp/python",
+            "capabilities": {"cuda": True, "mps": True},
+        },
+    )
+    resolved = resolve_spam_device("auto")
+    assert resolved["selected"] == "cuda"
+
+
+def test_resolve_spam_device_auto_falls_back_to_mps(monkeypatch) -> None:
+    monkeypatch.setattr(
+        spam_module,
+        "_probe_torch_capabilities",
+        lambda python_bin=None: {
+            "probe_python": "/tmp/python",
+            "capabilities": {"cuda": False, "mps": True},
+        },
+    )
+    resolved = resolve_spam_device("auto")
+    assert resolved["selected"] == "mps"
+
+
+def test_resolve_spam_device_raises_for_unavailable_mps(monkeypatch) -> None:
+    monkeypatch.setattr(
+        spam_module,
+        "_probe_torch_capabilities",
+        lambda python_bin=None: {
+            "probe_python": "/tmp/python",
+            "capabilities": {"cuda": False, "mps": False},
+        },
+    )
+    try:
+        resolve_spam_device("mps")
+    except RuntimeError as exc:
+        assert "MPS is not available" in str(exc)
+    else:
+        raise AssertionError("Expected RuntimeError for unavailable mps device")
 
 
 def test_superpixel_anything_overlap_flags_existing_methods() -> None:
@@ -92,6 +143,54 @@ def test_superpixel_anything_overlap_flags_existing_methods() -> None:
     assert "slic" in overlap["exact_overlap"]
     assert "ssn" in overlap["exact_overlap"]
     assert "sp_fcn" in overlap["lineage_overlap"]
+
+
+def test_apply_spam_runtime_patches_is_idempotent(tmp_path: Path) -> None:
+    repo_dir = tmp_path / "spam_repo"
+    (repo_dir / "SPAM" / "ssn").mkdir(parents=True)
+    (repo_dir / "SPAM" / "train.py").write_text(
+        (
+            "import os\n"
+            "import torch\n\n"
+            "def train(cfg):\n"
+            "    if torch.cuda.is_available():\n"
+            '        device = "cuda"\n'
+            "    else:\n"
+            '        device = "cpu"\n'
+            "    return device\n"
+        ),
+        encoding="utf-8",
+    )
+    (repo_dir / "SPAM" / "ssn" / "model.py").write_text(
+        (
+            "import os\n"
+            "import torch\n\n"
+            "def create_model(*args, **kwargs):\n"
+            '    device = "cuda" if torch.cuda.is_available() else "cpu"\n'
+            "    return device\n"
+        ),
+        encoding="utf-8",
+    )
+    (repo_dir / "SPAM" / "ssn" / "pair_wise_distance.py").write_text(
+        (
+            "import os\n"
+            "import torch\n"
+            "from torch.utils.cpp_extension import load\n"
+            "pair_wise_distance_cuda = load(name='pair_wise_distance_cuda', sources=['pair_wise_distance_cuda_source.cu'])\n"
+        ),
+        encoding="utf-8",
+    )
+
+    first = apply_spam_runtime_patches(repo_dir)
+    assert first["changed"] is True
+    assert len(first["changed_files"]) == 3
+    assert "SPAM_DEVICE" in (repo_dir / "SPAM" / "train.py").read_text(encoding="utf-8")
+    assert "SPAM_DEVICE" in (repo_dir / "SPAM" / "ssn" / "model.py").read_text(encoding="utf-8")
+    assert "SPAM_FORCE_CPU_PAIRWISE" in (repo_dir / "SPAM" / "ssn" / "pair_wise_distance.py").read_text(encoding="utf-8")
+
+    second = apply_spam_runtime_patches(repo_dir)
+    assert second["changed"] is False
+    assert second["changed_files"] == []
 
 
 def test_train_external_superpixels_dry_run_writes_metadata(tmp_path: Path) -> None:
@@ -122,6 +221,8 @@ def test_train_external_superpixels_dry_run_writes_metadata(tmp_path: Path) -> N
             "--python_bin",
             str(tmp_path / "spam_venv" / "bin" / "python"),
             "--dry_run",
+            "--device",
+            "cpu",
             "--train_iter",
             "11",
         ],

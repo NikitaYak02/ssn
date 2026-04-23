@@ -137,14 +137,25 @@ class LargestBadRegionGenerator:
     def _advance_region_selection_cycle(self) -> None:
         self._selection_step += 1
 
-    def _region_error_mask(self, cid: int, pred_mask: np.ndarray, mode: str) -> np.ndarray:
+    def _region_error_mask(
+        self,
+        cid: int,
+        pred_mask: np.ndarray,
+        mode: str,
+        annotated_mask: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
         gt_c = self.gt == cid
+        known_mask = (
+            np.asarray(annotated_mask, dtype=bool)
+            if annotated_mask is not None
+            else (pred_mask >= 0)
+        )
         if mode == "miou_gain":
             return gt_c & (pred_mask != cid)
         if mode == "largest_error":
-            return gt_c & (pred_mask >= 0) & (pred_mask != cid)
+            return gt_c & known_mask & (pred_mask != cid)
         if mode == "unannotated":
-            return gt_c & (pred_mask < 0)
+            return gt_c & (~known_mask)
         raise ValueError(f"Unsupported region selection mode: {mode!r}")
 
     def _largest_component(self, bad: np.ndarray) -> Optional[np.ndarray]:
@@ -781,13 +792,19 @@ class LargestBadRegionGenerator:
         self,
         pred_mask: np.ndarray,
         used_mask: np.ndarray,
+        annotated_mask: Optional[np.ndarray] = None,
         class_scribble_counts: Optional[List[int]] = None,
         selection_mode: str = "miou_gain",
     ) -> Tuple[Optional[int], Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
         inter, union = self._class_inter_union(pred_mask)
         raw_candidates = []
         for cid in range(self.num_classes):
-            bad_c = self._region_error_mask(cid, pred_mask, selection_mode)
+            bad_c = self._region_error_mask(
+                cid,
+                pred_mask,
+                selection_mode,
+                annotated_mask=annotated_mask,
+            )
             if not bad_c.any():
                 continue
             union_c = max(1, int(union[cid]))
@@ -890,6 +907,7 @@ class LargestBadRegionGenerator:
         self,
         pred_mask: np.ndarray,
         used_mask: np.ndarray,
+        annotated_mask: Optional[np.ndarray] = None,
         class_scribble_counts: Optional[List[int]] = None,
     ) -> Tuple[int, np.ndarray]:
         bad = pred_mask != self.gt
@@ -899,6 +917,7 @@ class LargestBadRegionGenerator:
         cid, comp, allowed, pts01 = self._select_class_component(
             pred_mask,
             used_mask,
+            annotated_mask=annotated_mask,
             class_scribble_counts=class_scribble_counts,
             selection_mode=selection_mode,
         )
@@ -906,6 +925,7 @@ class LargestBadRegionGenerator:
             cid, comp, allowed, pts01 = self._select_class_component(
                 pred_mask,
                 used_mask,
+                annotated_mask=annotated_mask,
                 class_scribble_counts=class_scribble_counts,
                 selection_mode="miou_gain",
             )

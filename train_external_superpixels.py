@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -70,6 +71,12 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--test_interval", type=int, default=5000)
     ap.add_argument("--weights", default=None)
     ap.add_argument("--model", default=None)
+    ap.add_argument(
+        "--device",
+        default="auto",
+        choices=["auto", "cuda", "mps", "cpu"],
+        help="Runtime device. auto prefers cuda, then mps, then cpu in the isolated method environment.",
+    )
     ap.add_argument("--loss_type", default="seg", choices=["seg", "contours", "seg_contours"])
     ap.add_argument("--normalize", action="store_true")
     ap.add_argument("--use_sam", action="store_true")
@@ -145,6 +152,7 @@ def main() -> int:
         loss_type=args.loss_type,
         weights=args.weights,
         model=args.model,
+        device=args.device,
     )
 
     metadata = {
@@ -161,9 +169,18 @@ def main() -> int:
         print(json.dumps(metadata, indent=2, ensure_ascii=False))
         return 0
 
+    runtime_env = dict(os.environ)
+    runtime_profile = dict(resolved.get("runtime_env") or {})
+    path_prefix = runtime_profile.get("path_prefix")
+    if path_prefix:
+        runtime_env["PATH"] = f"{path_prefix}{os.pathsep}{runtime_env.get('PATH', '')}"
+    for key, value in dict(runtime_profile.get("env_overrides") or {}).items():
+        runtime_env[str(key)] = str(value)
+
     subprocess.run(
         resolved["cmd"],
         cwd=resolved["cwd"],
+        env=runtime_env,
         check=True,
     )
     return 0

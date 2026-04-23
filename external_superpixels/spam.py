@@ -17,6 +17,116 @@ from PIL import Image
 ROOT = Path(__file__).resolve().parents[1]
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
 MASK_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".npy"}
+SPAM_DEVICE_CHOICES = {"auto", "cuda", "mps", "cpu"}
+SPAM_DEVICE_PRIORITY = ("cuda", "mps", "cpu")
+SPAM_PAIRWISE_PATCH_MARKER = "SPAM_FORCE_CPU_PAIRWISE"
+SPAM_PAIRWISE_PATCHED_SOURCE = """import os
+import warnings
+
+import torch
+from torch.utils.cpp_extension import load
+
+
+def _load_cuda_kernel():
+    # Allow explicit CPU fallback in non-CUDA environments.
+    if os.environ.get("SPAM_FORCE_CPU_PAIRWISE", "0") == "1":
+        return None
+    try:
+        return load(
+            name="pair_wise_distance_cuda",
+            sources=[
+                os.path.join(
+                    os.path.dirname(__file__),
+                    "pair_wise_distance_cuda_source.cu",
+                )
+            ],
+            extra_cuda_cflags=["-O2"],
+        )
+    except Exception as exc:
+        warnings.warn(
+            f"CUDA pairwise kernel is unavailable, using pure PyTorch fallback: {exc}",
+            RuntimeWarning,
+        )
+        return None
+
+
+pair_wise_distance_cuda = _load_cuda_kernel()
+
+
+def _pairwise_dist_cpu(
+    pixel_features,
+    spixel_features,
+    abs_spix_indinces,
+):
+    # abs_spix_indinces is expected as (B, 9, N) with valid indices >=0.
+    idx = abs_spix_indinces.long()
+    bsz, channels, num_pixels = pixel_features.shape
+    num_sp = spixel_features.shape[2]
+    idx = idx.reshape(bsz, 9, num_pixels)
+    valid = (idx >= 0) & (idx < num_sp)
+    idx = idx.clamp(0, num_sp - 1)
+    gather_idx = idx.reshape(bsz, 1, 9 * num_pixels).expand(bsz, channels, 9 * num_pixels)
+    gathered = torch.gather(spixel_features, 2, gather_idx).reshape(bsz, channels, 9, num_pixels)
+    dist = ((pixel_features[:, :, None, :] - gathered) ** 2).sum(1)
+    large = torch.finfo(dist.dtype).max / 2
+    return dist.masked_fill(~valid, large)
+
+
+if pair_wise_distance_cuda is not None:
+    class PairwiseDistFunction(torch.autograd.Function):
+        @staticmethod
+        def forward(
+            self,
+            pixel_features,
+            spixel_features,
+            abs_spix_indinces,
+            num_spixels_width,
+            num_spixels_height,
+        ):
+            self.num_spixels_width = num_spixels_width
+            self.num_spixels_height = num_spixels_height
+            output = pixel_features.new(pixel_features.shape[0], 9, pixel_features.shape[-1]).zero_()
+            self.save_for_backward(pixel_features, spixel_features, abs_spix_indinces)
+
+            return pair_wise_distance_cuda.forward(
+                pixel_features.contiguous(),
+                spixel_features.contiguous(),
+                abs_spix_indinces.contiguous(),
+                output,
+                self.num_spixels_width,
+                self.num_spixels_height,
+            )
+
+        @staticmethod
+        def backward(self, dist_matrix_grad):
+            pixel_features, spixel_features, abs_spix_indinces = self.saved_tensors
+
+            pixel_features_grad = torch.zeros_like(pixel_features)
+            spixel_features_grad = torch.zeros_like(spixel_features)
+
+            pixel_features_grad, spixel_features_grad = pair_wise_distance_cuda.backward(
+                dist_matrix_grad.contiguous(),
+                pixel_features.contiguous(),
+                spixel_features.contiguous(),
+                abs_spix_indinces.contiguous(),
+                pixel_features_grad,
+                spixel_features_grad,
+                self.num_spixels_width,
+                self.num_spixels_height,
+            )
+            return pixel_features_grad, spixel_features_grad, None, None, None
+else:
+    class PairwiseDistFunction:
+        @staticmethod
+        def apply(
+            pixel_features,
+            spixel_features,
+            abs_spix_indinces,
+            num_spixels_width,  # kept for API compatibility
+            num_spixels_height,  # kept for API compatibility
+        ):
+            return _pairwise_dist_cpu(pixel_features, spixel_features, abs_spix_indinces)
+"""
 
 
 def load_spam_manifest(path: str | Path | None = None) -> dict[str, object]:
@@ -94,6 +204,226 @@ def resolve_spam_paths(
                 venv_dir=resolved_venv_dir,
             )
         ),
+    }
+
+
+def _replace_once(
+    text: str,
+    *,
+    old: str,
+    new: str,
+    path: Path,
+    patch_name: str,
+) -> tuple[str, bool]:
+    if new in text:
+        return text, False
+    if old not in text:
+        raise RuntimeError(
+            f"Cannot apply {patch_name} to {path}: expected source fragment not found."
+        )
+    return text.replace(old, new, 1), True
+
+
+def _apply_spam_device_patch(path: Path, *, old: str, new: str, patch_name: str) -> bool:
+    text = path.read_text(encoding="utf-8")
+    updated_text, changed = _replace_once(
+        text,
+        old=old,
+        new=new,
+        path=path,
+        patch_name=patch_name,
+    )
+    if changed:
+        path.write_text(updated_text, encoding="utf-8")
+    return changed
+
+
+def _apply_spam_pairwise_patch(path: Path) -> bool:
+    text = path.read_text(encoding="utf-8")
+    if SPAM_PAIRWISE_PATCH_MARKER in text:
+        return False
+    path.write_text(SPAM_PAIRWISE_PATCHED_SOURCE, encoding="utf-8")
+    return True
+
+
+def apply_spam_runtime_patches(repo_dir: str | Path) -> dict[str, object]:
+    repo_root = Path(repo_dir).resolve()
+    train_path = repo_root / "SPAM" / "train.py"
+    model_path = repo_root / "SPAM" / "ssn" / "model.py"
+    pairwise_path = repo_root / "SPAM" / "ssn" / "pair_wise_distance.py"
+    for required in (train_path, model_path, pairwise_path):
+        if not required.exists():
+            raise FileNotFoundError(f"Missing expected SPAM source file: {required}")
+
+    changed_files: list[str] = []
+    train_changed = _apply_spam_device_patch(
+        train_path,
+        patch_name="SPAM train device selection",
+        old=(
+            "    if torch.cuda.is_available():\n"
+            '        device = "cuda"\n'
+            "    else:\n"
+            '        device = "cpu"\n'
+        ),
+        new=(
+            '    device_pref = os.environ.get("SPAM_DEVICE", "auto").strip().lower()\n'
+            '    if device_pref == "auto":\n'
+            "        if torch.cuda.is_available():\n"
+            '            device = "cuda"\n'
+            '        elif getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():\n'
+            '            device = "mps"\n'
+            "        else:\n"
+            '            device = "cpu"\n'
+            "    else:\n"
+            "        if device_pref not in {'cuda', 'mps', 'cpu'}:\n"
+            '            raise ValueError(f"Unsupported SPAM_DEVICE={device_pref!r}")\n'
+            "        device = device_pref\n"
+        ),
+    )
+    if train_changed:
+        changed_files.append(str(train_path))
+
+    model_changed = _apply_spam_device_patch(
+        model_path,
+        patch_name="SPAM model device selection",
+        old='    device = "cuda" if torch.cuda.is_available() else "cpu"\n',
+        new=(
+            '    device_pref = os.environ.get("SPAM_DEVICE", "auto").strip().lower()\n'
+            '    if device_pref == "auto":\n'
+            '        device = "cuda" if torch.cuda.is_available() else ("mps" if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available() else "cpu")\n'
+            "    else:\n"
+            "        if device_pref not in {'cuda', 'mps', 'cpu'}:\n"
+            '            raise ValueError(f"Unsupported SPAM_DEVICE={device_pref!r}")\n'
+            "        device = device_pref\n"
+        ),
+    )
+    if model_changed:
+        changed_files.append(str(model_path))
+
+    pairwise_changed = _apply_spam_pairwise_patch(pairwise_path)
+    if pairwise_changed:
+        changed_files.append(str(pairwise_path))
+
+    return {
+        "changed": bool(changed_files),
+        "changed_files": changed_files,
+    }
+
+
+def _probe_torch_capabilities(python_bin: str | Path | None = None) -> dict[str, object]:
+    probe_code = (
+        "import json\n"
+        "payload={'cuda': False, 'mps': False}\n"
+        "try:\n"
+        " import torch\n"
+        " payload['cuda'] = bool(torch.cuda.is_available())\n"
+        " mps_backend = getattr(getattr(torch, 'backends', None), 'mps', None)\n"
+        " payload['mps'] = bool(mps_backend is not None and mps_backend.is_available())\n"
+        "except Exception:\n"
+        " pass\n"
+        "print(json.dumps(payload))\n"
+    )
+    interpreters: list[Path] = []
+    if python_bin is not None:
+        interpreters.append(Path(python_bin))
+    interpreters.append(Path(sys.executable))
+
+    seen: set[str] = set()
+    for interpreter in interpreters:
+        key = str(interpreter.resolve()) if interpreter.exists() else str(interpreter)
+        if key in seen:
+            continue
+        seen.add(key)
+        if not interpreter.exists():
+            continue
+        proc = subprocess.run(
+            [str(interpreter), "-c", probe_code],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if proc.returncode != 0:
+            continue
+        try:
+            payload = json.loads((proc.stdout or "").strip() or "{}")
+        except json.JSONDecodeError:
+            continue
+        return {
+            "probe_python": str(interpreter.resolve()),
+            "capabilities": {
+                "cuda": bool(payload.get("cuda")),
+                "mps": bool(payload.get("mps")),
+            },
+        }
+
+    return {
+        "probe_python": None,
+        "capabilities": {"cuda": False, "mps": False},
+    }
+
+
+def resolve_spam_device(
+    device: str,
+    *,
+    python_bin: str | Path | None = None,
+) -> dict[str, object]:
+    requested = str(device).strip().lower()
+    if requested not in SPAM_DEVICE_CHOICES:
+        raise ValueError(f"Unsupported device {device!r}. Expected one of {sorted(SPAM_DEVICE_CHOICES)}.")
+    probe = _probe_torch_capabilities(python_bin=python_bin)
+    capabilities = dict(probe["capabilities"])
+
+    if requested == "auto":
+        selected = "cpu"
+        for candidate in SPAM_DEVICE_PRIORITY:
+            if candidate == "cpu":
+                selected = "cpu"
+                break
+            if bool(capabilities.get(candidate)):
+                selected = candidate
+                break
+    elif requested == "cuda":
+        if not bool(capabilities.get("cuda")):
+            raise RuntimeError(
+                "Requested device='cuda', but CUDA is not available in the selected python runtime. "
+                "Use --device auto or --device cpu."
+            )
+        selected = "cuda"
+    elif requested == "mps":
+        if not bool(capabilities.get("mps")):
+            raise RuntimeError(
+                "Requested device='mps', but MPS is not available in the selected python runtime. "
+                "Use --device auto or --device cpu."
+            )
+        selected = "mps"
+    else:
+        selected = "cpu"
+
+    return {
+        "requested": requested,
+        "selected": selected,
+        "capabilities": capabilities,
+        "probe_python": probe["probe_python"],
+    }
+
+
+def build_spam_runtime_env(
+    *,
+    selected_device: str,
+    venv_dir: str | Path,
+) -> dict[str, object]:
+    device = str(selected_device).strip().lower()
+    if device not in {"cuda", "mps", "cpu"}:
+        raise ValueError(f"Unsupported resolved SPAM device: {selected_device!r}")
+    env_overrides = {
+        "SPAM_DEVICE": device,
+        "SPAM_FORCE_CPU_PAIRWISE": "0" if device == "cuda" else "1",
+    }
+    if device == "mps":
+        env_overrides["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+    return {
+        "env_overrides": env_overrides,
+        "path_prefix": str(Path(venv_dir).resolve() / "bin"),
     }
 
 
@@ -255,6 +585,7 @@ def bootstrap_spam_environment(
         ["git", "-C", str(paths["repo_dir"]), "checkout", commit],
         check=True,
     )
+    apply_spam_runtime_patches(paths["repo_dir"])
 
     if not paths["python_bin"].exists():
         paths["venv_dir"].parent.mkdir(parents=True, exist_ok=True)
@@ -293,12 +624,27 @@ def build_spam_train_command(
     loss_type: str = "seg",
     weights: str | None = None,
     model: str | None = None,
+    device: str = "auto",
 ) -> dict[str, object]:
     paths = resolve_spam_paths(
         manifest,
         repo_dir=repo_dir,
         venv_dir=venv_dir,
         python_bin=python_bin,
+    )
+    patch_info: dict[str, object]
+    if paths["repo_dir"].exists():
+        patch_info = apply_spam_runtime_patches(paths["repo_dir"])
+    else:
+        patch_info = {
+            "changed": False,
+            "changed_files": [],
+            "warning": f"SPAM repo not found at {paths['repo_dir']}; runtime patches were not applied.",
+        }
+    device_info = resolve_spam_device(device, python_bin=paths["python_bin"])
+    runtime_env = build_spam_runtime_env(
+        selected_device=str(device_info["selected"]),
+        venv_dir=paths["venv_dir"],
     )
     cmd = [
         str(paths["python_bin"]),
@@ -346,5 +692,8 @@ def build_spam_train_command(
     return {
         "cmd": cmd,
         "cwd": str(paths["train_cwd"]),
+        "device": device_info,
+        "runtime_env": runtime_env,
+        "runtime_patches": patch_info,
         "paths": {key: str(value) for key, value in paths.items()},
     }

@@ -2474,6 +2474,9 @@ def render_annotation_snapshot(
                 if border.ndim != 2 or border.shape[0] < 3:
                     continue
                 gt_id = max(0, min(int(anno.code) - 1, len(class_info) - 1))
+                # Не заливаем фон поверх изображения, чтобы кадр не становился "черным".
+                if gt_id == 0:
+                    continue
                 fill = _hex_to_rgba_tuple(class_info[gt_id][1], int(anno_alpha))
                 _draw_polygon_with_holes(draw, border, anno.holes, fill=fill)
 
@@ -2493,6 +2496,8 @@ def render_annotation_snapshot(
                 continue
             line_pts = [(float(x * W), float(y * H)) for x, y in pts]
             gt_id = max(0, min(int(scribble.params.code) - 1, len(class_info) - 1))
+            if gt_id == 0:
+                continue
             line_color = _hex_to_rgba_tuple(class_info[gt_id][1], 255)
             draw_scr.line(line_pts, fill=line_color, width=5)
 

@@ -44,6 +44,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 import cv2
 import numpy as np
 from PIL import Image, ImageDraw
+import re
 
 
 DEFAULT_CLASS_INFO = [
@@ -73,7 +74,12 @@ _PANEL_BG_BGR = (30, 33, 38)
 _ANNOTATION_FILL_ALPHA = 110
 _NEW_ANNOTATION_FILL_ALPHA = 190
 _SUPERPIXEL_BORDER_ALPHA = 0.4
-_SUPERPIXEL_BORDER_RGBA = (255, 255, 0, int(round(255 * _SUPERPIXEL_BORDER_ALPHA)))
+_SUPERPIXEL_BORDER_RGBA = (170, 170, 170, int(round(255 * _SUPERPIXEL_BORDER_ALPHA)))
+_PROPAGATION_GLOW_RGB = (255, 255, 255)
+_ERROR_BG_BGR = (20, 20, 20)
+_ERROR_FN_BGR = (0, 0, 255)   # red: missed GT foreground
+_ERROR_FP_BGR = (255, 0, 0)   # blue: false foreground
+_ERROR_OK_BGR = (44, 44, 44)
 
 
 def _hex_to_bgr(h: str) -> Tuple[int, int, int]:
@@ -423,6 +429,32 @@ def load_optional_image(image_path: Optional[Path], render_width: int, render_he
     return cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
 
 
+def load_optional_mask(mask_path: Optional[Path], render_width: int, render_height: int) -> Optional[np.ndarray]:
+    if mask_path is None:
+        return None
+    if not mask_path.exists():
+        raise FileNotFoundError(f"Mask not found: {mask_path}")
+    mask = Image.open(mask_path).convert("L").resize((render_width, render_height), Image.Resampling.NEAREST)
+    return np.array(mask, dtype=np.uint8)
+
+
+def infer_image_and_mask_from_run_log(run_dir: Path) -> Tuple[Optional[Path], Optional[Path]]:
+    log_path = run_dir / "run.log"
+    if not log_path.exists():
+        return None, None
+    text = log_path.read_text(encoding="utf-8", errors="replace")
+    m = re.search(r"Image:\s+(\S+)", text)
+    if m is None:
+        return None, None
+    image_path = Path(m.group(1))
+    mask_path: Optional[Path] = None
+    if "/imgs/" in str(image_path):
+        candidate = Path(str(image_path).replace("/imgs/", "/masks/")).with_suffix(".png")
+        if candidate.exists():
+            mask_path = candidate
+    return image_path if image_path.exists() else None, mask_path
+
+
 def load_snapshot_image(
     run_dir: Path,
     checkpoint_index: int,
@@ -467,6 +499,10 @@ def blank_background(width: int, height: int) -> np.ndarray:
     return np.clip(base, 0, 255).astype(np.uint8)
 
 
+def white_background(width: int, height: int) -> np.ndarray:
+    return np.full((height, width, 3), 255, dtype=np.uint8)
+
+
 def _poly_points_xy(points_px: np.ndarray) -> List[Tuple[int, int]]:
     arr = np.asarray(points_px, dtype=np.int32)
     if arr.ndim == 3 and arr.shape[1] == 1:
@@ -508,6 +544,24 @@ def _emphasis_fill_alpha(frame_idx: int, frame_count: int) -> int:
     return int(round(_NEW_ANNOTATION_FILL_ALPHA + (_ANNOTATION_FILL_ALPHA - _NEW_ANNOTATION_FILL_ALPHA) * progress))
 
 
+def _pulse01(frame_idx: int, frame_count: int) -> float:
+    if frame_count <= 1:
+        return 1.0
+    progress = min(max(float(frame_idx) / float(frame_count - 1), 0.0), 1.0)
+    return 0.5 - 0.5 * np.cos(np.pi * progress)
+
+
+def _crossfade_frames(start: np.ndarray, end: np.ndarray, count: int) -> List[np.ndarray]:
+    if count <= 0:
+        return []
+    out: List[np.ndarray] = []
+    for idx in range(1, count + 1):
+        alpha = float(idx) / float(count + 1)
+        frame = cv2.addWeighted(end, alpha, start, 1.0 - alpha, 0.0)
+        out.append(frame)
+    return out
+
+
 def _max_present_code(*sources: object) -> int:
     max_code = 1
     for source in sources:
@@ -547,8 +601,15 @@ def render_panel(
     class_info: Sequence[Tuple[str, str]],
     show_borders: bool = True,
     highlight_alpha: Optional[int] = None,
+    propagation_phase: Optional[float] = None,
+    use_white_background: bool = False,
 ) -> np.ndarray:
-    base_panel = base_image.copy() if base_image is not None else blank_background(state.render_width, state.render_height)
+    if base_image is not None:
+        base_panel = base_image.copy()
+    else:
+        base_panel = white_background(state.render_width, state.render_height) if use_white_background else blank_background(
+            state.render_width, state.render_height
+        )
     base_rgba = Image.fromarray(cv2.cvtColor(base_panel, cv2.COLOR_BGR2RGB)).convert("RGBA")
     overlay = Image.new("RGBA", (state.render_width, state.render_height), (255, 255, 255, 0))
     draw = ImageDraw.Draw(overlay)
@@ -566,6 +627,7 @@ def render_panel(
         for poly_px, holes_px in state.superpixels_by_id.values():
             _draw_polygon_with_holes(draw, poly_px, holes_px, outline=_SUPERPIXEL_BORDER_RGBA)
 
+    prop_ids = set(int(v) for v in highlight_prop)
     emphasis_ids = list(dict.fromkeys([*highlight_direct, *highlight_prop]))
     emphasis_alpha = int(highlight_alpha if highlight_alpha is not None else _NEW_ANNOTATION_FILL_ALPHA)
     for sp_id in emphasis_ids:
@@ -573,12 +635,25 @@ def render_panel(
         if anno is None:
             continue
         class_idx = max(0, min(len(class_info) - 1, int(anno.code) - 1))
+        alpha = emphasis_alpha
+        if sp_id in prop_ids and propagation_phase is not None:
+            alpha = int(round(emphasis_alpha + 36 * _pulse01(int(round(propagation_phase * 100)), 100)))
         _draw_polygon_with_holes(
             draw,
             anno.poly_px,
             anno.holes_px,
-            fill=_hex_to_rgba(class_info[class_idx][1], emphasis_alpha),
+            fill=_hex_to_rgba(class_info[class_idx][1], alpha),
         )
+        if sp_id in prop_ids:
+            glow_alpha = 110
+            if propagation_phase is not None:
+                glow_alpha = int(round(72 + 70 * _pulse01(int(round(propagation_phase * 100)), 100)))
+            _draw_polygon_with_holes(
+                draw,
+                anno.poly_px,
+                anno.holes_px,
+                outline=(*_PROPAGATION_GLOW_RGB, glow_alpha),
+            )
 
     composite = Image.alpha_composite(base_rgba, overlay)
     draw_scribbles = ImageDraw.Draw(composite)
@@ -628,24 +703,78 @@ def compose_canvas(
     return canvas
 
 
-def make_intro_frame(run_name: str, width: int, height: int, final_step: int, max_gap: int) -> np.ndarray:
-    canvas = np.full((height, width, 3), _BG_BGR, dtype=np.uint8)
-    lines = [
-        "Interactive Annotation Replay",
-        run_name,
-        f"Final saved step: {final_step}",
-    ]
-    if max_gap <= 1:
-        lines.append("Exact replay from saved checkpoints.")
-    else:
-        lines.append(f"Coarse replay: the largest gap is {max_gap} scribbles.")
-        lines.append("For exact replay, rerun evaluate_interactive_annotation.py with --save_every 1.")
-    y0 = max(80, height // 3)
-    for idx, line in enumerate(lines):
-        scale = 1.0 if idx == 0 else 0.72
-        gap = 44 if idx == 0 else 36
-        yy = y0 + idx * gap
-        _draw_text_block(canvas, [line], (36, yy), _TEXT_MAIN_BGR if idx == 0 else _TEXT_SUB_BGR, scale, gap)
+def render_pred_mask(state: LoadedState, annotations_by_sp: Dict[int, AnnotationData]) -> np.ndarray:
+    mask = np.zeros((state.render_height, state.render_width), dtype=np.uint8)
+    for anno in annotations_by_sp.values():
+        if int(anno.code) <= 0:
+            continue
+        poly = np.asarray(anno.poly_px, dtype=np.int32)
+        if poly.size == 0:
+            continue
+        cv2.fillPoly(mask, [poly], int(anno.code))
+        for hole in anno.holes_px:
+            hole_poly = np.asarray(hole, dtype=np.int32)
+            if hole_poly.size > 0:
+                cv2.fillPoly(mask, [hole_poly], 0)
+    return mask
+
+
+def render_error_map(pred_mask: np.ndarray, gt_mask: Optional[np.ndarray]) -> np.ndarray:
+    h, w = pred_mask.shape[:2]
+    panel = np.full((h, w, 3), _ERROR_BG_BGR, dtype=np.uint8)
+    if gt_mask is None:
+        _draw_text_block(panel, ["GT mask is unavailable"], (24, max(36, h // 2)), _TEXT_SUB_BGR, 0.9, 28)
+        return panel
+
+    gt_fg = gt_mask > 0
+    pred_fg = pred_mask > 0
+    fn = gt_fg & (~pred_fg)
+    fp = (~gt_fg) & pred_fg
+    ok = gt_fg & pred_fg
+
+    panel[fn] = _ERROR_FN_BGR
+    panel[fp] = _ERROR_FP_BGR
+    panel[ok] = _ERROR_OK_BGR
+    return panel
+
+
+def compose_dual_canvas(main_panel: np.ndarray, error_panel: np.ndarray, miou: Optional[float]) -> np.ndarray:
+    h, w = main_panel.shape[:2]
+    gap = 12
+    header_h = 88
+    total_w = w * 2 + gap * 3
+    total_h = h + header_h + gap * 2
+    canvas = np.full((total_h, total_w, 3), _BG_BGR, dtype=np.uint8)
+
+    left_x = gap
+    right_x = left_x + w + gap
+    y = header_h + gap
+    canvas[y : y + h, left_x : left_x + w] = main_panel
+    canvas[y : y + h, right_x : right_x + w] = error_panel
+
+    cv2.rectangle(canvas, (left_x - 1, y - 1), (left_x + w, y + h), _BORDER_BGR, 2)
+    cv2.rectangle(canvas, (right_x - 1, y - 1), (right_x + w, y + h), _BORDER_BGR, 2)
+
+    miou_text = "mIoU: --" if miou is None else f"mIoU: {miou:.4f}"
+    _draw_text_block(canvas, [miou_text], (24, 58), _TEXT_MAIN_BGR, 1.35, 44)
+    _draw_text_block(canvas, ["Current annotation", "Error map (red=FN, blue=FP)"], (int(total_w * 0.55), 34), _TEXT_SUB_BGR, 0.54, 26)
+    return canvas
+
+
+def compose_dual_canvas_with_bg(
+    main_panel: np.ndarray,
+    error_panel: np.ndarray,
+    miou: Optional[float],
+    *,
+    white_background: bool,
+) -> np.ndarray:
+    canvas = compose_dual_canvas(main_panel, error_panel, miou)
+    if not white_background:
+        return canvas
+
+    # Keep panel content untouched; only switch surrounding canvas background to white.
+    dark_bg_mask = np.all(canvas == np.array(_BG_BGR, dtype=np.uint8), axis=2)
+    canvas[dark_bg_mask] = 255
     return canvas
 
 
@@ -694,6 +823,8 @@ def render_run_video(
     method: Optional[str],
     timing: TimingConfig,
     logger: logging.Logger,
+    use_white_background: bool = False,
+    disable_snapshots: bool = False,
 ) -> Path:
     state_files = discover_state_files(run_dir)
     if not state_files:
@@ -704,23 +835,23 @@ def render_run_video(
     metrics_by_step = _read_metrics_csv(run_dir / "metrics.csv")
     snapshot_cache: Dict[int, Optional[np.ndarray]] = {}
 
-    base_image = load_optional_image(image_path, states[0].render_width, states[0].render_height) if image_path else None
+    inferred_image, inferred_mask = infer_image_and_mask_from_run_log(run_dir)
+    effective_image_path = image_path if image_path is not None else inferred_image
+    base_image = load_optional_image(effective_image_path, states[0].render_width, states[0].render_height) if effective_image_path else None
+    gt_mask = load_optional_mask(inferred_mask, states[0].render_width, states[0].render_height) if inferred_mask else None
 
     frame_w = states[0].render_width
     frame_h = states[0].render_height
+    video_w = frame_w * 2 + 12 * 3
+    video_h = frame_h + 88 + 12 * 2
     out_path.parent.mkdir(parents=True, exist_ok=True)
     writer, _codec_name = _open_video_writer(
         out_path=out_path,
         fps=float(fps),
-        frame_size=(frame_w, frame_h),
+        frame_size=(video_w, video_h),
         logger=logger,
     )
     try:
-        max_gap = max((event.step_delta for event in events), default=0)
-        intro = make_intro_frame(run_dir.name, frame_w, frame_h, states[-1].n_scribbles, max_gap)
-        for _ in range(max(1, timing.intro_frames)):
-            writer.write(intro)
-
         prev_annotations: Dict[int, AnnotationData] = {}
         prev_step = 0
         for idx, (state, event) in enumerate(zip(states, events)):
@@ -729,13 +860,14 @@ def render_run_video(
             prev_scribbles: Sequence[ScribbleData] = states[idx - 1].scribbles if idx > 0 else ()
             prev_snapshot = None
             if idx > 0:
-                prev_snapshot = load_snapshot_image(
-                    run_dir=run_dir,
-                    checkpoint_index=states[idx - 1].checkpoint_index,
-                    render_width=state.render_width,
-                    render_height=state.render_height,
-                    cache=snapshot_cache,
-                )
+                if not disable_snapshots:
+                    prev_snapshot = load_snapshot_image(
+                        run_dir=run_dir,
+                        checkpoint_index=states[idx - 1].checkpoint_index,
+                        render_width=state.render_width,
+                        render_height=state.render_height,
+                        cache=snapshot_cache,
+                    )
             current_snapshot = load_snapshot_image(
                 run_dir=run_dir,
                 checkpoint_index=state.checkpoint_index,
@@ -743,6 +875,8 @@ def render_run_video(
                 render_height=state.render_height,
                 cache=snapshot_cache,
             )
+            if disable_snapshots:
+                current_snapshot = None
 
             if prev_snapshot is not None:
                 before_panel = prev_snapshot
@@ -755,10 +889,17 @@ def render_run_video(
                     highlight_prop=[],
                     scribbles=prev_scribbles,
                     class_info=_build_default_class_info(_max_present_code(prev_annotations, prev_scribbles, state.annotations_by_sp, state.scribbles)),
+                    use_white_background=use_white_background,
                 )
-            before_title = f"Before step {state.n_scribbles}" if event.step_delta == 1 else f"Before checkpoint {state.checkpoint_index}"
-            before_sub = f"Saved annotations: {len(prev_annotations)} superpixels"
-            before_canvas = compose_canvas(before_panel, run_dir.name, before_title, before_sub, footer)
+            before_pred = render_pred_mask(state, prev_annotations)
+            before_error = render_error_map(before_pred, gt_mask)
+            before_miou = None if metrics is None else metrics.get("miou")
+            before_canvas = compose_dual_canvas_with_bg(
+                before_panel,
+                before_error,
+                before_miou,
+                white_background=use_white_background,
+            )
             for _ in range(max(1, timing.pre_frames)):
                 writer.write(before_canvas)
 
@@ -776,10 +917,11 @@ def render_run_video(
                 if event.step_delta > 0
                 else "No new scribbles in this checkpoint."
             )
+            direct_panel: Optional[np.ndarray] = None
+            last_prop_canvas: Optional[np.ndarray] = None
 
             if event.step_delta > 0:
                 direct_frame_count = max(1, timing.direct_frames)
-                direct_panel = None
                 for frame_idx in range(direct_frame_count):
                     direct_panel = render_panel(
                         state=state,
@@ -792,12 +934,23 @@ def render_run_video(
                         show_borders=(prev_snapshot is None),
                         highlight_alpha=_emphasis_fill_alpha(frame_idx, direct_frame_count),
                     )
-                    direct_canvas = compose_canvas(direct_panel, run_dir.name, focus_title, focus_sub, footer)
+                    direct_pred = render_pred_mask(state, state.annotations_by_sp)
+                    direct_error = render_error_map(direct_pred, gt_mask)
+                    direct_canvas = compose_dual_canvas_with_bg(
+                        direct_panel,
+                        direct_error,
+                        None if metrics is None else metrics.get("miou"),
+                        white_background=use_white_background,
+                    )
+                    if frame_idx == 0:
+                        for fade in _crossfade_frames(before_canvas, direct_canvas, max(1, direct_frame_count // 2)):
+                            writer.write(fade)
                     writer.write(direct_canvas)
 
                 prop_frame_count = max(1, timing.prop_frames)
                 prop_base = direct_panel if direct_panel is not None else (prev_snapshot if prev_snapshot is not None else base_image)
                 for frame_idx in range(prop_frame_count):
+                    phase = float(frame_idx) / float(max(1, prop_frame_count - 1))
                     prop_panel = render_panel(
                         state=state,
                         base_image=prop_base,
@@ -808,9 +961,28 @@ def render_run_video(
                         class_info=class_info,
                         show_borders=False,
                         highlight_alpha=_emphasis_fill_alpha(frame_idx, prop_frame_count),
+                        propagation_phase=phase,
+                        use_white_background=use_white_background,
                     )
-                    prop_canvas = compose_canvas(prop_panel, run_dir.name, focus_title, focus_sub, footer)
+                    prop_pred = render_pred_mask(state, state.annotations_by_sp)
+                    prop_error = render_error_map(prop_pred, gt_mask)
+                    prop_canvas = compose_dual_canvas_with_bg(
+                        prop_panel,
+                        prop_error,
+                        None if metrics is None else metrics.get("miou"),
+                        white_background=use_white_background,
+                    )
+                    if frame_idx == 0 and direct_panel is not None:
+                        direct_canvas_for_fade = compose_dual_canvas_with_bg(
+                            direct_panel,
+                            prop_error,
+                            None if metrics is None else metrics.get("miou"),
+                            white_background=use_white_background,
+                        )
+                        for fade in _crossfade_frames(direct_canvas_for_fade, prop_canvas, max(1, prop_frame_count // 2)):
+                            writer.write(fade)
                     writer.write(prop_canvas)
+                    last_prop_canvas = prop_canvas
 
             if current_snapshot is not None:
                 final_panel = current_snapshot
@@ -823,12 +995,28 @@ def render_run_video(
                     highlight_prop=[],
                     scribbles=state.scribbles,
                     class_info=class_info,
+                    use_white_background=use_white_background,
                 )
-            final_title = f"Committed state after step {state.n_scribbles}"
-            if event.step_delta > 1:
-                final_title += f" (+{event.step_delta} saved together)"
-            final_sub = f"Annotated superpixels: {len(state.annotations_by_sp)} | Previous step: {prev_step}"
-            final_canvas = compose_canvas(final_panel, run_dir.name, final_title, final_sub, footer)
+            final_pred = render_pred_mask(state, state.annotations_by_sp)
+            final_error = render_error_map(final_pred, gt_mask)
+            final_canvas = compose_dual_canvas_with_bg(
+                final_panel,
+                final_error,
+                None if metrics is None else metrics.get("miou"),
+                white_background=use_white_background,
+            )
+            if event.step_delta > 0:
+                transition_from = last_prop_canvas
+                if transition_from is None and direct_panel is not None:
+                    transition_from = compose_dual_canvas_with_bg(
+                        direct_panel,
+                        final_error,
+                        None if metrics is None else metrics.get("miou"),
+                        white_background=use_white_background,
+                    )
+                if transition_from is not None:
+                    for fade in _crossfade_frames(transition_from, final_canvas, max(1, timing.final_frames // 2)):
+                        writer.write(fade)
             for _ in range(max(1, timing.final_frames)):
                 writer.write(final_canvas)
 
@@ -842,6 +1030,8 @@ def render_run_video(
             render_height=states[-1].render_height,
             cache=snapshot_cache,
         )
+        if disable_snapshots:
+            outro_snapshot = None
         if outro_snapshot is not None:
             outro_panel = outro_snapshot
         else:
@@ -853,13 +1043,16 @@ def render_run_video(
                 highlight_prop=[],
                 scribbles=states[-1].scribbles,
                 class_info=_build_default_class_info(_max_present_code(states[-1].annotations_by_sp, states[-1].scribbles)),
+                use_white_background=use_white_background,
             )
-        outro_canvas = compose_canvas(
+        outro_pred = render_pred_mask(states[-1], states[-1].annotations_by_sp)
+        outro_error = render_error_map(outro_pred, gt_mask)
+        outro_miou = None if metrics_by_step.get(states[-1].n_scribbles) is None else metrics_by_step[states[-1].n_scribbles].get("miou")
+        outro_canvas = compose_dual_canvas_with_bg(
             outro_panel,
-            run_dir.name,
-            f"Final saved state: step {states[-1].n_scribbles}",
-            f"Total annotated superpixels: {len(states[-1].annotations_by_sp)}",
-            metrics_footer(metrics_by_step.get(states[-1].n_scribbles)),
+            outro_error,
+            outro_miou,
+            white_background=use_white_background,
         )
         for _ in range(max(1, timing.outro_frames)):
             writer.write(outro_canvas)
@@ -878,12 +1071,14 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--method", default=None, help="Method key from the saved state; defaults to the first available one")
     ap.add_argument("--fps", type=float, default=8.0, help="Output video FPS")
     ap.add_argument("--max_side", type=int, default=1600, help="Resize the longest rendered side to at most this value")
-    ap.add_argument("--intro_seconds", type=float, default=1.2)
+    ap.add_argument("--intro_seconds", type=float, default=0.0)
     ap.add_argument("--pre_seconds", type=float, default=0.35)
     ap.add_argument("--direct_seconds", type=float, default=0.55)
     ap.add_argument("--prop_seconds", type=float, default=0.70)
     ap.add_argument("--final_seconds", type=float, default=0.35)
     ap.add_argument("--outro_seconds", type=float, default=1.0)
+    ap.add_argument("--white_background", action="store_true", help="Render with plain white background when base image is absent")
+    ap.add_argument("--disable_snapshots", action="store_true", help="Do not use frame_*.png snapshots; always render from annotations")
     return ap
 
 
@@ -954,6 +1149,8 @@ def main() -> None:
             method=args.method,
             timing=timing,
             logger=logger,
+            use_white_background=bool(args.white_background),
+            disable_snapshots=bool(args.disable_snapshots),
         )
 
 

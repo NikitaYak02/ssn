@@ -293,7 +293,7 @@ class StepMetrics:
 def compute_ious(pred: np.ndarray, gt: np.ndarray,
                  num_classes: int) -> Tuple[float, List[float]]:
     """
-    pred: (H,W) int32, -1 = не размечено.
+    pred: (H,W) int32, где -1 — неразмечено, 0..C-1 — классы.
     gt:   (H,W) int32, 0-indexed class ids.
     """
     ious: List[float] = []
@@ -322,18 +322,33 @@ def scribble_length_px(pts_norm: np.ndarray, H: int, W: int) -> float:
 # ─────────────────────────────────────────────────────────────────────────────────
 
 class PredMaskUpdater:
-    """Хранит текущую pred-маску и эффективно перерисовывает аннотации."""
+    """Хранит текущую pred-маску и отдельную маску явной разметки."""
 
     def __init__(self, H: int, W: int):
         self.H, self.W = H, W
+        # По умолчанию пиксели не размечены.
         self.pred_np = np.full((H, W), -1, dtype=np.int32)
-        self._pil = Image.fromarray(self.pred_np, mode="I")
+        self.explicit_np = np.zeros((H, W), dtype=bool)
+        self._pred_pil = Image.fromarray(self.pred_np, mode="I")
+        self._explicit_pil = Image.fromarray(
+            np.zeros((H, W), dtype=np.uint8), mode="L"
+        )
 
     def reset(self) -> None:
         self.pred_np[:] = -1
-        self._pil = Image.fromarray(self.pred_np, mode="I")
+        self.explicit_np[:] = False
+        self._pred_pil = Image.fromarray(self.pred_np, mode="I")
+        self._explicit_pil = Image.fromarray(
+            np.zeros((self.H, self.W), dtype=np.uint8), mode="L"
+        )
 
-    def paint_polygon(self, poly_xy: List[Tuple[float, float]], value: int) -> None:
+    def paint_polygon(
+        self,
+        poly_xy: List[Tuple[float, float]],
+        value: int,
+        *,
+        explicit: bool = True,
+    ) -> None:
         if len(poly_xy) < 3:
             return
         xs = [p[0] for p in poly_xy]
@@ -344,13 +359,22 @@ class PredMaskUpdater:
         y1 = min(self.H, int(np.ceil(max(ys))) + 1)
         if x1 <= x0 or y1 <= y0:
             return
-        crop = self._pil.crop((x0, y0, x1, y1))
-        ImageDraw.Draw(crop).polygon(
+        crop_pred = self._pred_pil.crop((x0, y0, x1, y1))
+        ImageDraw.Draw(crop_pred).polygon(
             [(float(x - x0), float(y - y0)) for x, y in poly_xy],
             fill=int(value),
         )
-        self._pil.paste(crop, (x0, y0))
-        self.pred_np[y0:y1, x0:x1] = np.array(crop, dtype=np.int32)
+        self._pred_pil.paste(crop_pred, (x0, y0))
+        self.pred_np[y0:y1, x0:x1] = np.array(crop_pred, dtype=np.int32)
+
+        if explicit:
+            crop_exp = self._explicit_pil.crop((x0, y0, x1, y1))
+            ImageDraw.Draw(crop_exp).polygon(
+                [(float(x - x0), float(y - y0)) for x, y in poly_xy],
+                fill=255,
+            )
+            self._explicit_pil.paste(crop_exp, (x0, y0))
+            self.explicit_np[y0:y1, x0:x1] = np.array(crop_exp, dtype=np.uint8) > 0
 
     def repaint_all(self, algo: "structs.SuperPixelAnnotationAlgo",
                     sp_method: "structs.SuperPixelMethod",
@@ -367,7 +391,7 @@ class PredMaskUpdater:
                 for i in range(len(border))
             ]
             pred_class = max(0, min(int(anno.code) - 1, num_classes - 1))
-            self.paint_polygon(poly, pred_class)
+            self.paint_polygon(poly, pred_class, explicit=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────────
@@ -480,14 +504,20 @@ class LargestBadRegionGenerator:
         cid: int,
         pred_mask: np.ndarray,
         mode: str,
+        annotated_mask: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         gt_c = (self.gt == cid)
+        known_mask = (
+            np.asarray(annotated_mask, dtype=bool)
+            if annotated_mask is not None
+            else (pred_mask >= 0)
+        )
         if mode == "miou_gain":
             return gt_c & (pred_mask != cid)
         if mode == "largest_error":
-            return gt_c & (pred_mask >= 0) & (pred_mask != cid)
+            return gt_c & known_mask & (pred_mask != cid)
         if mode == "unannotated":
-            return gt_c & (pred_mask < 0)
+            return gt_c & (~known_mask)
         raise ValueError(f"Unsupported region selection mode: {mode!r}")
 
     # -- helpers ---
@@ -1275,6 +1305,7 @@ class LargestBadRegionGenerator:
         self,
         pred_mask: np.ndarray,
         used_mask: np.ndarray,
+        annotated_mask: Optional[np.ndarray] = None,
         class_scribble_counts: Optional[List[int]] = None,
         selection_mode: str = "miou_gain",
     ) -> Tuple[Optional[int], Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
@@ -1282,7 +1313,12 @@ class LargestBadRegionGenerator:
         raw_candidates = []
 
         for cid in range(self.num_classes):
-            bad_c = self._region_error_mask(cid, pred_mask, selection_mode)
+            bad_c = self._region_error_mask(
+                cid,
+                pred_mask,
+                selection_mode,
+                annotated_mask=annotated_mask,
+            )
             if not bad_c.any():
                 continue
 
@@ -1430,6 +1466,7 @@ class LargestBadRegionGenerator:
         self,
         pred_mask: np.ndarray,
         used_mask: np.ndarray,
+        annotated_mask: Optional[np.ndarray] = None,
         class_scribble_counts: Optional[List[int]] = None,
     ) -> Tuple[int, np.ndarray]:
         """
@@ -1447,6 +1484,7 @@ class LargestBadRegionGenerator:
         cid, comp, allowed, pts01 = self._select_class_component(
             pred_mask,
             used_mask,
+            annotated_mask=annotated_mask,
             class_scribble_counts=class_scribble_counts,
             selection_mode=selection_mode,
         )
@@ -1454,6 +1492,7 @@ class LargestBadRegionGenerator:
             cid, comp, allowed, pts01 = self._select_class_component(
                 pred_mask,
                 used_mask,
+                annotated_mask=annotated_mask,
                 class_scribble_counts=class_scribble_counts,
                 selection_mode="miou_gain",
             )
@@ -1730,6 +1769,8 @@ def render_snapshot(
                 poly = [(float(b[i, 0] * W), float(b[i, 1] * H)) for i in range(len(b))]
                 code = int(anno.code)
                 gt_id = max(0, min(code - 1, len(class_info) - 1))
+                if gt_id == 0:
+                    continue
                 draw.polygon(poly, fill=_hex_to_rgba(class_info[gt_id][1], anno_alpha))
 
     if draw_borders:
@@ -1747,6 +1788,8 @@ def render_snapshot(
             line_pts = [(float(pts[i, 0] * W), float(pts[i, 1] * H)) for i in range(len(pts))]
             code = int(s.params.code)
             gt_id = max(0, min(code - 1, len(class_info) - 1))
+            if gt_id == 0:
+                continue
             d2.line(line_pts, fill=_hex_to_rgba(class_info[gt_id][1], 255), width=5)
 
     out_png.parent.mkdir(parents=True, exist_ok=True)
@@ -1997,10 +2040,15 @@ def run_single_image(
         pred: np.ndarray,
         n_scr: int,
         total_ink_now: float,
+        explicit_mask: Optional[np.ndarray] = None,
     ) -> None:
         nonlocal dynamic_csv_writer
 
-        annotated_mask = (pred >= 0)
+        annotated_mask = (
+            np.asarray(explicit_mask, dtype=bool)
+            if explicit_mask is not None
+            else (pred >= 0)
+        )
         annotated_px = int(annotated_mask.sum())
         correct_mask = annotated_mask & (pred == gt)
         correctly_px = int(correct_mask.sum())
@@ -2046,7 +2094,7 @@ def run_single_image(
         pred_upd.repaint_all(algo, sp_method, num_classes)
         pred = pred_upd.pred_np
 
-        annotated_mask = (pred >= 0)
+        annotated_mask = pred_upd.explicit_np
         annotated_px = int(annotated_mask.sum())
         correct_mask = annotated_mask & (pred == gt)
         correctly_px = int(correct_mask.sum())
@@ -2097,6 +2145,7 @@ def run_single_image(
         pred=pred_upd.pred_np,
         n_scr=len(ink_list),
         total_ink_now=total_ink,
+        explicit_mask=pred_upd.explicit_np,
     )
     no_progress_steps = 0
 
@@ -2105,14 +2154,15 @@ def run_single_image(
         sid = start_step + step_idx
         scribble_id = next_scribble_id + step_idx - 1
         prev_pred = pred_upd.pred_np
-        prev_annotated_px = int((prev_pred >= 0).sum())
-        prev_correct_px = int(((prev_pred >= 0) & (prev_pred == gt)).sum())
+        prev_annotated_px = int(pred_upd.explicit_np.sum())
+        prev_correct_px = int((pred_upd.explicit_np & (prev_pred == gt)).sum())
 
         # --- Генерируем штрих ---
         try:
             gt_id, pts01 = generator.make_scribble(
                 pred_upd.pred_np,
                 used_mask,
+                annotated_mask=pred_upd.explicit_np,
                 class_scribble_counts=per_class_n_scr,
             )
         except StopIteration as e:
@@ -2171,13 +2221,14 @@ def run_single_image(
                 pred_upd.paint_polygon(poly, pred_class)
 
         cur_pred = pred_upd.pred_np
-        cur_annotated_px = int((cur_pred >= 0).sum())
-        cur_correct_px = int(((cur_pred >= 0) & (cur_pred == gt)).sum())
+        cur_annotated_px = int(pred_upd.explicit_np.sum())
+        cur_correct_px = int((pred_upd.explicit_np & (cur_pred == gt)).sum())
         write_dynamic_metrics(
             step=sid,
             pred=cur_pred,
             n_scr=len(ink_list),
             total_ink_now=total_ink,
+            explicit_mask=pred_upd.explicit_np,
         )
         made_progress = (
             cur_annotated_px > prev_annotated_px

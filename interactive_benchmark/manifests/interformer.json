@@ -17,7 +17,7 @@
   "inference": {
     "config_path": "{repo_root}/.external_sources/interformer/work_dirs/interformer_tiny_coco_lvis_320k/interformer_tiny_coco_lvis_320k.py",
     "checkpoint_path": "{repo_root}/.external_sources/interformer/work_dirs/interformer_tiny_coco_lvis_320k/iter_320000.pth",
-    "device": "cpu",
+    "device": "auto",
     "size_divisor": 32,
     "inner_radius": 5,
     "outer_radius": 0

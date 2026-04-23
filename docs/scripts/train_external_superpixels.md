@@ -49,6 +49,7 @@ python3 train_external_superpixels.py \
 | `--venv_dir VENV_DIR` | Явно указать путь к isolated venv. |
 | `--dry_run` | Ничего не обучать, только собрать команду и metadata. |
 | `--type_model {ssn,resnet50,resnet101,mobilenetv3}` | Trainable variant из официального кода `SPAM`. |
+| `--device {auto,cuda,mps,cpu}` | Девайс для upstream runtime; `auto` выбирает `cuda -> mps -> cpu`. |
 | `--use_sam` | Включить SAM masks during training. |
 
 ## Примечания
@@ -56,3 +57,4 @@ python3 train_external_superpixels.py \
 - Upstream `SPAM` ждёт BSDS-style `.mat`, поэтому обычные PNG-маски скрипт сначала адаптирует.
 - В текущем upstream help упоминается `deeplabv3`, но сам кодовый путь реально поддерживает `mobilenetv3`; wrapper экспонирует именно фактически доступные варианты.
 - Внешние репозитории и их venv лучше держать в `.external_sources/` и `.method_envs/`.
+- Wrapper автоматически применяет runtime-патчи в локальном clone `SPAM`, чтобы выбор `--device` корректно работал для `cuda/mps/cpu` и чтобы в не-CUDA окружениях использовался fallback для pairwise distance ядра.
